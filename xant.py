@@ -39,7 +39,7 @@ client = TelegramClient(
     API_HASH,
     connection_retries=10,
     retry_delay=3,
-    timeout=60  # Увеличили таймаут для больших файлов
+    timeout=60  # Увеличенный таймаут для стабильного скачивания файлов > 2 ГБ
 )
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
@@ -64,8 +64,11 @@ def extract_all_links(text: str):
 
 
 async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3):
-    """Теперь функция принимает chat_id и msg_id для возможности обновления ссылки"""
-    # Сначала получаем актуальное сообщение
+    """
+    Функция скачивания медиафайла.
+    Принимает chat_id и msg_id для возможности безопасного 
+    перезапроса file_reference при долгой загрузке.
+    """
     target_msg = await client.get_messages(chat_id, ids=msg_id)
     
     if not target_msg or not target_msg.media:
@@ -73,14 +76,12 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
 
     for attempt in range(1, max_retries + 1):
         try:
-            # Передаем именно весь объект target_msg, чтобы Telethon мог автоматически обновлять file_reference
             return await client.download_media(
                 target_msg,
                 progress_callback=progress_callback
             )
         except FileReferenceExpiredError:
-            print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Обновляем сообщение...")
-            # Перезапрашиваем сообщение заново с серверов Telegram, чтобы получить новый file_reference
+            print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Перезапрашиваем сообщение...")
             target_msg = await client.get_messages(chat_id, ids=msg_id)
             if attempt == max_retries:
                 raise
@@ -111,7 +112,7 @@ async def handle_saved_messages(event):
 
         async def progress_callback(current, total):
             now = time.time()
-            if now - last_update_time[0] > 3 or current == total:  # Увеличили шаг до 3 секунд, чтобы не ловить флуд-вейты на изменении текста сообщения
+            if now - last_update_time[0] > 3 or current == total:
                 last_update_time[0] = now
                 percent = (current / total) * 100
                 mb_current = current / (1024 * 1024)
@@ -133,58 +134,57 @@ async def handle_saved_messages(event):
             await status_msg.edit(
                 f"⏳ **Обработка [{index}/{total_count}]**\n"
                 f"🔗 `{full_link}`\n"
-                f"🔎 Получение сообщения..."
+                f"🔎 Проверка доступа к чату..."
             )
 
-            # Проверяем доступность чата, активируя entity в кэше Telethon
             try:
                 await client.get_entity(chat_id)
-            except Exception as entity_err:
+            except Exception:
                 await event.respond(
-                    f"⚠️ **[{index}/{total_count}]** Нет доступа к закрытому чату `{chat_id}`. Вы состоите в нём? Скип."
+                    f"⚠️ **[{index}/{total_count}]** Нет доступа к закрытому чату `{chat_id}`. "
+                    f"Убедитесь, что ваш аккаунт состоит в нём. Пропуск."
                 )
                 continue
 
-            # Вызываем исправленную функцию загрузки
             filename = await download_with_retry(chat_id, msg_id, progress_callback)
 
             if not filename:
                 await event.respond(
-                    f"⚠️ **[{index}/{total_count}]** Медиафайл не найден по адресу `{full_link}`."
+                    f"⚠️ **[{index}/{total_count}]** Файл не найден или сообщение недоступно: `{full_link}`."
                 )
                 continue
 
-            # Проверяем размер скачанного файла перед отправкой
-            file_size_bytes = os.path.getsize(filename)
-            file_size_gb = file_size_bytes / (1024 ** 3)
+            file_size_gb = os.path.getsize(filename) / (1024 ** 3)
 
             await status_msg.edit(
-                f"📤 **[{index}/{total_count}]** Отправка файла ({file_size_gb:.2f} GB) в сохраненные сообщения..."
+                f"📤 **[{index}/{total_count}]** Отправка файла ({file_size_gb:.2f} GB) в Избранное..."
             )
             
             try:
-                await client.send_file("me", filename)
+                # Безопасная отправка больших файлов без MemoryError
+                await client.send_file("me", filename, force_document=True)
                 await event.respond(f"✅ **[{index}/{total_count}]** Файл успешно перезалит из `{full_link}`")
+                
+                if os.path.exists(filename):
+                    os.remove(filename)
+                    
             except Exception as upload_err:
-                # Если файл > 2ГБ (или > 4ГБ для Premium), Telegram не даст его отправить назад через send_file
+                # Обработка жесткого лимита Telegram на размер файла (2ГБ/4ГБ)
                 await event.respond(
-                    f"⚠️ **[{index}/{total_count}]** Файл скачан локально как `{filename}`, но Telegram "
-                    f"отклонил его отправку назад (Размер: {file_size_gb:.2f} GB). Ошибка: `{upload_err}`.\n"
-                    f"Пожалуйста, заберите файл прямо с сервера/компьютера, где запущен скрипт."
+                    f"⚠️ **[{index}/{total_count}]** Файл успешно скачан локально, но Telegram "
+                    f"отклонил отправку обратно в чат (Размер: {file_size_gb:.2f} GB).\n"
+                    f"Это происходит, если размер превышает лимиты вашего аккаунта (2 ГБ обычный / 4 ГБ Premium).\n"
+                    f"❌ Ошибка отправки: `{upload_err}`.\n"
+                    f"📁 Файл сохранен на сервере/компьютере под именем: `{filename}`"
                 )
 
         except Exception as e:
             await event.respond(
                 f"❌ **[{index}/{total_count}]** Ошибка обработки ссылки `{full_link}`:\n`{e}`"
             )
-        finally:
-            # Удаляем файл ТОЛЬКО если он успешно отправился. 
-            # Если отправка упала из-за лимита размера, файл останется на диске, чтобы вы его не потеряли.
             if filename and os.path.exists(filename):
                 try:
-                    # Раскомментируйте строку ниже, если хотите удалять файл в любом случае:
-                    # os.remove(filename)
-                    pass 
+                    os.remove(filename)
                 except Exception:
                     pass
 
@@ -197,7 +197,7 @@ async def main():
     print("⏳ Подключение к Telegram...")
     await client.start()
     await client.get_dialogs()
-    print("\n🚀 Все готово! Отправьте ссылку на закрытые/открытые сообщения в свое Избранное.")
+    print("\n🚀 Все готово! Отправьте ссылку на закрытые/открытые сообщения в свое Избранное (Saved Messages).")
     await client.run_until_disconnected()
 
 
