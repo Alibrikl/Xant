@@ -69,6 +69,7 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
     Принимает chat_id и msg_id для возможности безопасного 
     перезапроса file_reference при долгой загрузке.
     """
+    # Первичное получение сообщения
     target_msg = await client.get_messages(chat_id, ids=msg_id)
     
     if not target_msg or not target_msg.media:
@@ -81,8 +82,10 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
                 progress_callback=progress_callback
             )
         except FileReferenceExpiredError:
-            print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Перезапрашиваем сообщение...")
-            target_msg = await client.get_messages(chat_id, ids=msg_id)
+            print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Перезапрашиваем сообщение без кэша...")
+            # ВАЖНО: Использование use_cache=False принудительно запрашивает у серверов Telegram 
+            # новый рабочий file_reference, предотвращая циклические ошибки загрузки больших файлов
+            target_msg = await client.get_messages(chat_id, ids=msg_id, use_cache=False)
             if attempt == max_retries:
                 raise
         except Exception as e:
@@ -161,7 +164,6 @@ async def handle_saved_messages(event):
             )
             
             try:
-                # Безопасная отправка больших файлов без MemoryError
                 await client.send_file("me", filename, force_document=True)
                 await event.respond(f"✅ **[{index}/{total_count}]** Файл успешно перезалит из `{full_link}`")
                 
@@ -169,7 +171,6 @@ async def handle_saved_messages(event):
                     os.remove(filename)
                     
             except Exception as upload_err:
-                # Обработка жесткого лимита Telegram на размер файла (2ГБ/4ГБ)
                 await event.respond(
                     f"⚠️ **[{index}/{total_count}]** Файл успешно скачан локально, но Telegram "
                     f"отклонил отправку обратно в чат (Размер: {file_size_gb:.2f} GB).\n"
