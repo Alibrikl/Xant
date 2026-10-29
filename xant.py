@@ -237,4 +237,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    client.loop.run_until_complete(main())
+    import logging
+    # Включаем подробный вывод логов Telethon в консоль
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+        level=logging.INFO
+    )
+    
+    try:
+        client.loop.run_until_complete(main())
+    except Exception as crash_error:
+        print(f"\n❌ КРИТИЧЕСКИЙ СБОЙ ПРИ ЗАПУСКЕ: {crash_error}")
