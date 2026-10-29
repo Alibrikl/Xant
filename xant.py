@@ -111,10 +111,11 @@ async def handle_saved_messages(event):
     )
 
     for index, (chat_id, msg_id, full_link) in enumerate(links, start=1):
-        last_update_time = [0]
+        last_update_time = [0]  # Изменяемый контекст в виде списка
 
         async def progress_callback(current, total):
             now = time.time()
+            # ИСПРАВЛЕНО: корректное обращение к элементу списка [0]
             if now - last_update_time[0] > 3 or current == total:
                 last_update_time[0] = now
                 percent = (current / total) * 100
