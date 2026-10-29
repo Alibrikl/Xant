@@ -24,6 +24,7 @@ LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
 
 CONCURRENT_DOWNLOADS = 3   # одновременно качаемых файлов
+CLEANUP_DELAY = 10         # [NEW] секунд перед удалением служебных сообщений
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -50,13 +51,10 @@ client = TelegramClient("user_session", API_ID, API_HASH, connection_retries=10,
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 
-# Очередь ссылок (без maxsize — воркеры сами регулируют параллелизм)
 link_queue: asyncio.Queue = asyncio.Queue()
-
 processed: set[tuple] = set()
 cancel_flag = {"cancel": False}
 
-# Статистика пачек: batch_id -> {"event", "total", "ok", "skip", "fail"}
 batches: dict[int, dict] = {}
 batch_counter = {"id": 0}
 
@@ -91,6 +89,20 @@ def _play_sound_sync():
 
 async def play_sound():
     await asyncio.to_thread(_play_sound_sync)
+
+
+# ---------- Отложенное удаление ----------
+async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
+    """Удаляет сообщения через delay секунд (не блокирует воркер)."""
+    if delay > 0:
+        await asyncio.sleep(delay)
+    for m in messages:
+        if m is None:
+            continue
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 
 # ---------- Имена файлов ----------
@@ -228,7 +240,6 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
 
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
-    """Обрабатывает одну ссылку. Возвращает 'ok' / 'skip' / 'fail'."""
     batch = batches[batch_id]
 
     key = (chat_id, msg_id)
@@ -327,10 +338,6 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
 
 # ---------- Воркер ----------
 async def link_worker(worker_id: int):
-    """
-    Один воркер. Запускается CONCURRENT_DOWNLOADS раз.
-    Берёт ссылку из очереди сразу, как только освободился.
-    """
     while True:
         try:
             chat_id, msg_id, full_link, batch_id = await link_queue.get()
@@ -349,7 +356,6 @@ async def link_worker(worker_id: int):
                 await _maybe_finish_batch(batch_id)
 
         except Exception as e:
-            # Воркер не должен падать — иначе пул уменьшится
             print(f"[worker #{worker_id}] Необработанная ошибка: {e}")
             batch = batches.get(batch_id)
             if batch is not None:
@@ -361,7 +367,6 @@ async def link_worker(worker_id: int):
 
 
 async def _maybe_finish_batch(batch_id: int):
-    """Когда все ссылки пачки обработаны — выводит итог и звук."""
     b = batches.get(batch_id)
     if b is None:
         return
@@ -369,23 +374,28 @@ async def _maybe_finish_batch(batch_id: int):
     if done < b["total"]:
         return
 
-    await b["event"].respond(
+    summary_msg = await b["event"].respond(
         f"✅ **Пачка обработана!**\n"
         f"├ Успешно: {b['ok']}\n"
         f"├ Пропущено (дубли): {b['skip']}\n"
         f"└ Ошибок: {b['fail']}"
     )
+    b["to_delete"].append(summary_msg)
 
     if b["ok"] > 0:
         if os.path.exists(NOTIFY_SOUND):
             try:
-                await client.send_file(
+                notify_msg = await client.send_file(
                     "me", NOTIFY_SOUND, voice_note=True,
                     caption=f"🔔 Пачка обработана: {b['ok']} файл(ов)",
                 )
+                b["to_delete"].append(notify_msg)
             except Exception as e:
                 print(f"[notify] Не удалось отправить {NOTIFY_SOUND}: {e}")
         asyncio.create_task(play_sound())
+
+    # [NEW] отложенное удаление служебных сообщений
+    asyncio.create_task(_delete_later(*b["to_delete"]))
 
     batches.pop(batch_id, None)
 
@@ -435,18 +445,20 @@ async def handle_saved_messages(event):
     batches[batch_id] = {
         "event": event, "total": len(links),
         "ok": 0, "skip": 0, "fail": 0,
+        # [NEW] сообщение с ссылками тоже пойдёт под удаление
+        "to_delete": [event],
     }
     cancel_flag["cancel"] = False
 
-    # Кладём ссылки в очередь. Свободные воркеры тут же их заберут.
     for chat_id, msg_id, full_link in links:
         await link_queue.put((chat_id, msg_id, full_link, batch_id))
 
-    await event.respond(
+    info_msg = await event.respond(
         f"📥 Добавлено ссылок: {len(links)}. "
         f"Одновременно качается до {CONCURRENT_DOWNLOADS}. "
         f"Всего в очереди: {link_queue.qsize()}"
     )
+    batches[batch_id]["to_delete"].append(info_msg)
 
 
 # ---------- Запуск ----------
@@ -455,7 +467,6 @@ async def main():
     await client.start()
     await client.get_dialogs()
 
-    # Постоянный пул воркеров
     workers = [
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
@@ -464,6 +475,7 @@ async def main():
 
     print(
         f"\n🚀 Готово! Одновременных загрузок: {CONCURRENT_DOWNLOADS}.\n"
+        f"Служебные сообщения удаляются через {CLEANUP_DELAY} сек после пачки.\n"
         f"Команды: /stop, /clear, /stats"
     )
     try:
