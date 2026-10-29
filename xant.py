@@ -45,7 +45,7 @@ client = TelegramClient(
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 
-# Глобальная асинхронная очередь задач для строго последовательной обработки
+# Глобальная асинхронная очередь задач для последовательной обработки
 task_queue = asyncio.Queue()
 
 
@@ -83,46 +83,41 @@ def check_free_space(required_bytes: int) -> bool:
     """Кроссплатформенная проверка доступного места на диске с запасом в 1 ГБ"""
     current_dir = os.getcwd()
     total, used, free = shutil.disk_usage(current_dir)
-    # Оставляем обязательный резервный 1 ГБ для стабильной работы ОС
-    safety_reserve = 1024 * 1024 * 1024
+    safety_reserve = 1024 * 1024 * 1024  # Резервный 1 ГБ безопасности
     return free > (required_bytes + safety_reserve)
 
 
 def play_sound_notification():
     """Воспроизводит системный звуковой сигнал (BEEP) на любой ОС"""
     try:
-        print("\a", end="", flush=True)  # Стандартный ASCII сигнал bell
+        print("\a", end="", flush=True)
     except Exception:
         pass
 
 
 async def download_with_retry(chat_id, msg_id, progress_callback, status_msg, index, total_count, max_retries=3):
     """
-    Функция скачивания медиафайла с предварительной проверкой свободного места на диске.
+    Функция скачивания медиафайла.
+    Принимает chat_id и msg_id для возможности безопасного 
+    перезапроса file_reference при долгой загрузке.
     """
     target_msg = await client.get_messages(chat_id, ids=msg_id)
     
     if not target_msg or not target_msg.media:
         return None
 
-    # Извлекаем размер файла из метаданных сообщения
+    # Предварительная проверка диска перед началом скачивания
     file_size_bytes = target_msg.file.size if target_msg.file else 0
-    
-    # Автоматическая проверка диска перед скачиванием
     if not check_free_space(file_size_bytes):
         required_mb = file_size_bytes / (1024 * 1024)
-        current_dir = os.getcwd()
-        _, _, free_bytes = shutil.disk_usage(current_dir)
+        _, _, free_bytes = shutil.disk_usage(os.getcwd())
         free_mb = free_bytes / (1024 * 1024)
         
-        error_text = (
+        await status_msg.respond(
             f"❌ **🚫 Пропуск [{index}/{total_count}]**\n"
             f"Недостаточно места на диске сервера/ПК!\n"
-            f"Требуется для файла: **{required_mb:.1f} MB**\n"
-            f"Доступно (с учетом резерва ОС): **{free_mb:.1f} MB**"
+            f"Файлу нужно: **{required_mb:.1f} MB**, доступно: **{free_mb:.1f} MB**"
         )
-        print(f"\n[Ошибка] Мало места на диске. Требуется {required_mb:.1f}MB, доступно {free_mb:.1f}MB.")
-        await status_msg.respond(error_text)
         return "INSUFFICIENT_DISK_SPACE"
 
     suggested_filename = get_original_filename(target_msg)
@@ -146,7 +141,7 @@ async def download_with_retry(chat_id, msg_id, progress_callback, status_msg, in
 
 
 async def task_worker():
-    """Фоновый воркер, выполняющий задачи из очереди строго последовательно (один за другим)"""
+    """Фоновый воркер, выполняющий задачи из очереди строго по очереди (один за другим)"""
     while True:
         event, links = await task_queue.get()
         total_count = len(links)
@@ -193,13 +188,13 @@ async def task_worker():
                     )
                     continue
 
-                # Начинаем скачивание файла
+                # Скачиваем файл с оригинальным именем и валидацией диска
                 filename = await download_with_retry(
                     chat_id, msg_id, progress_callback, status_msg, index, total_count
                 )
 
                 if filename == "INSUFFICIENT_DISK_SPACE":
-                    continue  # Локальный пропуск итерации, если диск забит
+                    continue
 
                 if not filename:
                     await event.respond(
@@ -208,8 +203,8 @@ async def task_worker():
                     continue
 
                 file_size_gb = os.path.getsize(filename) / (1024 ** 3)
-
-                # Воспроизводим аудио-оповещение сразу после успешной локальной загрузки
+                
+                # Подаем звуковой сигнал сразу по завершении скачивания на диск
                 play_sound_notification()
 
                 await status_msg.edit(
@@ -217,21 +212,18 @@ async def task_worker():
                 )
                 
                 try:
-                    # Отправка обратно в Saved Messages как документ
                     await client.send_file("me", filename, force_document=True)
                     await event.respond(f"✅ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно перезалит!")
                     
-                    # Удаляем только в случае успешного аплоада обратно
                     if os.path.exists(filename):
                         os.remove(filename)
                         
                 except Exception as upload_err:
-                    # Файл остается на диске, если аккаунт без Premium уперся в лимит при отправке
                     await event.respond(
-                        f"⚠️ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно скачан локально, но Telegram отклонил отправку обратно\n"
+                        f"⚠️ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно скачан локально, но Telegram отклонил отправку\n"
                         f"(Размер: {file_size_gb:.2f} GB).\n"
-                        f"Это ограничение размера вашего аккаунта (2 ГБ обычный / 4 ГБ Premium).\n"
-                        f"📁 Файл сохранен под именем: `{filename}`"
+                        f"Лимит аккаунта: 2 ГБ обычный / 4 ГБ Premium.\n"
+                        f"📁 Файл сохранен на сервере под именем: `{filename}`"
                     )
 
             except Exception as e:
@@ -261,3 +253,17 @@ async def handle_saved_messages(event):
     if not links:
         return
 
+    # Кладем задачу в асинхронную очередь задач для строго последовательного скачивания
+    await task_queue.put((event, links))
+    await event.respond("📥 Ссылки успешно добавлены в очередь обработки. Скрипт скачает файлы последовательно один за другим.")
+
+
+async def main():
+    print("⏳ Подключение к Telegram...")
+    await client.start()
+    await client.get_dialogs()
+    
+    # Запускаем фоновый обработчик очереди задач
+    asyncio.create_task(task_worker())
+    
+    print("\n🚀 Все готово! Отправьте ссылку на закрытые/открытые сообщения в свое Избранное (Saved Messages).")
