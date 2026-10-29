@@ -7,7 +7,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FileReferenceExpiredError, FloodWaitError
 
 # Импортируем оптимизированные методы из fast_telethon
-from fast_telethon import download_file, upload_file
+from FastTelethon import download_file, upload_file
 
 ENV_FILE = ".env"
 
