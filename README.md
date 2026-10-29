@@ -36,7 +36,7 @@ Simply forward or paste post links into your **Saved Messages**, and **Xant** wi
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/wuskish/Xant.git
+git clone https://github.com/Alibrikl/Xant.git
 cd Xant
 ```
 ### 2. Install Dependencies
