@@ -1,4 +1,4 @@
-[29.10.2026 21:42] Aleh: import os
+import os
 import re
 import sys
 import time
@@ -245,7 +245,8 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
     chat_title = await get_chat_title(chat_id)
     suggested_filename = build_filename(target_msg, chat_title)
     local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
-[29.10.2026 21:42] Aleh: for attempt in range(1, max_retries + 1):
+
+    for attempt in range(1, max_retries + 1):
         try:
             return await client.download_media(
                 target_msg,
@@ -288,7 +289,7 @@ async def task_worker():
             key = (chat_id, msg_id)
             if key in processed:
                 await event.respond(
-                    f"♻️ [{index}/{total_count}] Уже обработано ранее, пропуск: {full_link}"
+                    f"♻️ **[{index}/{total_count}]** Уже обработано ранее, пропуск: `{full_link}`"
                 )
                 skipped_count += 1
                 continue
@@ -304,9 +305,9 @@ async def task_worker():
                     percent = (current / total) * 100
                     try:
                         await status_msg.edit(
-                            f"⏳ Скачивание [{index}/{total_count}]\n"
-                            f"🔗 {full_link}\n"
-                            f"📥 {percent:.1f}% "
+                            f"⏳ **Скачивание [{index}/{total_count}]**\n"
+                            f"🔗 `{full_link}`\n"
+                            f"📥 **{percent:.1f}%** "
                             f"({human_size(current)} / {human_size(total)})"
                         )
                     except FloodWaitError as fwe:
@@ -321,9 +322,9 @@ async def task_worker():
                     percent = (current / total) * 100 if total else 0
                     try:
                         await status_msg.edit(
-                            f"📤 Отправка [{index}/{total_count}]\n"
-                            f"📁 {os.path.basename(filename or '')}\n"
-                            f"📊 {percent:.1f}% "
+                            f"📤 **Отправка [{index}/{total_count}]**\n"
+                            f"📁 `{os.path.basename(filename or '')}`\n"
+                            f"📊 **{percent:.1f}%** "
                             f"({human_size(current)} / {human_size(total)})"
                         )
                     except FloodWaitError as fwe:
@@ -333,22 +334,22 @@ async def task_worker():
 
             try:
                 await status_msg.edit(
-                    f"⏳ Обработка [{index}/{total_count}]\n"
-                    f"🔗 {full_link}\n"
+                    f"⏳ **Обработка [{index}/{total_count}]**\n"
+                    f"🔗 `{full_link}`\n"
                     f"🔎 Проверка доступа..."
                 )
 
                 target_msg = await client.get_messages(chat_id, ids=msg_id)
                 if not target_msg:
                     await event.respond(
-                        f"⚠️ [{index}/{total_count}] Сообщение недоступно: {full_link}"
+                        f"⚠️ **[{index}/{total_count}]** Сообщение недоступно: `{full_link}`"
                     )
                     failed_count += 1
                     continue
 
                 if not target_msg.media:
                     await event.respond(
-                        f"⚠️ [{index}/{total_count}] В сообщении нет медиа: {full_link}"
+                        f"⚠️ **[{index}/{total_count}]** В сообщении нет медиа: `{full_link}`"
                     )
                     failed_count += 1
                     continue
@@ -356,14 +357,14 @@ async def task_worker():
                 file_size = target_msg.file.size if target_msg.file else 0
                 if file_size > LIMIT_PREMIUM:
                     await event.respond(
-                        f"⚠️ [{index}/{total_count}] Файл слишком большой для Telegram "
-                        f"({human_size(file_size)} > 4 ГБ). Пропуск: {full_link}"
+                        f"⚠️ **[{index}/{total_count}]** Файл слишком большой для Telegram "
+                        f"({human_size(file_size)} > 4 ГБ). Пропуск: `{full_link}`"
                     )
                     failed_count += 1
                     continue
                 if file_size > LIMIT_FREE:
                     await event.respond(
-                        f"ℹ️ [{index}/{total_count}] Файл {human_size(file_size)} > 2 ГБ — "
+                        f"ℹ️ **[{index}/{total_count}]** Файл {human_size(file_size)} > 2 ГБ — "
                         f"для отправки нужен Premium. Скачаю, но перезалить не смогу."
                     )
 
@@ -371,7 +372,7 @@ async def task_worker():
 
                 if not filename:
                     await event.respond(
-                        f"⚠️ [{index}/{total_count}] Не удалось скачать: {full_link}"
+                        f"⚠️ **[{index}/{total_count}]** Не удалось скачать: `{full_link}`"
                     )
                     failed_count += 1
                     continue
@@ -388,7 +389,7 @@ async def task_worker():
                     await client.send_file("me", file_handle, force_document=True)
 
                 await event.respond(
-                    f"✅ [{index}/{total_count}] {os.path.basename(filename)} "
+                    f"✅ **[{index}/{total_count}]** `{os.path.basename(filename)}` "
                     f"({file_size_gb:.2f} GB) перезалит в Избранное!"
                 )
                 processed.add(key)
@@ -402,7 +403,7 @@ async def task_worker():
 
             except Exception as e:
                 await event.respond(
-                    f"❌ [{index}/{total_count}] Ошибка {full_link}:\n{e}"
+                    f"❌ **[{index}/{total_count}]** Ошибка `{full_link}`:\n`{e}`"
                 )
                 failed_count += 1
                 if filename and os.path.exists(filename):
@@ -412,7 +413,7 @@ async def task_worker():
                         pass
 
         await status_msg.edit(
-            f"✅ Пакет обработан!\n"
+            f"✅ **Пакет обработан!**\n"
             f"├ Успешно: {ok_count}\n"
             f"├ Пропущено (дубли): {skipped_count}\n"
             f"└ Ошибок: {failed_count}"
@@ -447,7 +448,8 @@ async def handle_saved_messages(event):
             "⛔ Команда отмены получена — текущая пачка будет остановлена после текущего файла."
         )
         return
-[29.10.2026 21:42] Aleh: if cmd == "/clear":
+
+    if cmd == "/clear":
         cleared = 0
         while not task_queue.empty():
             try:
@@ -461,7 +463,7 @@ async def handle_saved_messages(event):
 
     if cmd == "/stats":
         await event.respond(
-            f"📊 Статистика\n"
+            f"📊 **Статистика**\n"
             f"├ В очереди пачек: {task_queue.qsize()}\n"
             f"└ Обработано уникальных файлов: {len(processed)}"
         )
@@ -502,7 +504,7 @@ async def main():
     await client.run_until_disconnected()
 
 
-if name == "main":
+if __name__ == "__main__":
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,
