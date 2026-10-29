@@ -457,3 +457,15 @@ async def main():
         f"Команды: /stop, /clear, /stats"
     )
     await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.WARNING,
+    )
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    try:
+        client.loop.run_until_complete(main())
+    except Exception as crash_error:
+        print(f"\n❌ КРИТИЧЕСКИЙ СБОЙ: {crash_error}")
