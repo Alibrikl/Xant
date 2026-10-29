@@ -51,7 +51,7 @@ python xant.py
 ```bash
 pkg update && pkg upgrade -y
 pkg install python git -y
-git clone https://github.com/wuskish/Xant.git
+git clone https://github.com/Alibrikl/Xant.git
 cd Xant
 pip install -r requirements.txt
 python xant.py
