@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import shutil
 import asyncio
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -44,7 +45,7 @@ client = TelegramClient(
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 
-# Глобальная асинхронная очередь задач для последовательной обработки
+# Глобальная асинхронная очередь задач для строго последовательной обработки
 task_queue = asyncio.Queue()
 
 
@@ -71,39 +72,70 @@ def get_original_filename(message):
     if not message or not message.media:
         return None
         
-    # Попытка получить имя из атрибутов файла Telegram
     if message.file and message.file.name:
         return message.file.name
         
-    # Если имени нет (например, видео без названия), генерируем понятное имя с правильным расширением
     ext = message.file.ext if message.file and message.file.ext else ".dat"
     return f"telegram_file_{message.chat_id}_{message.id}{ext}"
 
 
-async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3):
+def check_free_space(required_bytes: int) -> bool:
+    """Кроссплатформенная проверка доступного места на диске с запасом в 1 ГБ"""
+    current_dir = os.getcwd()
+    total, used, free = shutil.disk_usage(current_dir)
+    # Оставляем обязательный резервный 1 ГБ для стабильной работы ОС
+    safety_reserve = 1024 * 1024 * 1024
+    return free > (required_bytes + safety_reserve)
+
+
+def play_sound_notification():
+    """Воспроизводит системный звуковой сигнал (BEEP) на любой ОС"""
+    try:
+        print("\a", end="", flush=True)  # Стандартный ASCII сигнал bell
+    except Exception:
+        pass
+
+
+async def download_with_retry(chat_id, msg_id, progress_callback, status_msg, index, total_count, max_retries=3):
     """
-    Функция скачивания медиафайла.
-    Принимает chat_id и msg_id для возможности безопасного 
-    перезапроса file_reference при долгой загрузке.
+    Функция скачивания медиафайла с проверкой свободного места на диске.
     """
     target_msg = await client.get_messages(chat_id, ids=msg_id)
     
     if not target_msg or not target_msg.media:
         return None
 
-    # Получаем оригинальное имя файла
+    # Извлекаем размер файла из метаданных сообщения
+    file_size_bytes = target_msg.file.size if target_msg.file else 0
+    
+    # Автоматическая превентивная проверка диска
+    if not check_free_space(file_size_bytes):
+        required_mb = file_size_bytes / (1024 * 1024)
+        current_dir = os.getcwd()
+        _, _, free_bytes = shutil.disk_usage(current_dir)
+        free_mb = free_bytes / (1024 * 1024)
+        
+        error_text = (
+            f"❌ **🚫 Пропуск [{index}/{total_count}]**\n"
+            f"Недостаточно места на диске сервера/ПК!\n"
+            f"Требуется для файла: **{required_mb:.1f} MB**\n"
+            f"Доступно (с учетом резерва ОС): **{free_mb:.1f} MB**"
+        )
+        print(f"\n[Ошибка] Мало места на диске. Требуется {required_mb:.1f}MB, доступно {free_mb:.1f}MB.")
+        await status_msg.respond(error_text)
+        return "INSUFFICIENT_DISK_SPACE"
+
     suggested_filename = get_original_filename(target_msg)
 
     for attempt in range(1, max_retries + 1):
         try:
             return await client.download_media(
                 target_msg,
-                file=suggested_filename,  # Передаем оригинальное имя файла для сохранения на диск
+                file=suggested_filename,
                 progress_callback=progress_callback
             )
         except FileReferenceExpiredError:
             print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Перезапрашиваем сообщение без кэша...")
-            # ВАЖНО: use_cache=False принудительно обновляет file_reference для больших файлов
             target_msg = await client.get_messages(chat_id, ids=msg_id, use_cache=False)
             if attempt == max_retries:
                 raise
@@ -114,7 +146,7 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
 
 
 async def task_worker():
-    """Фоновый воркер, выполняющий задачи из очереди строго по очереди (один за другим)"""
+    """Фоновый воркер, выполняющий задачи из очереди строго последовательно"""
     while True:
         event, links = await task_queue.get()
         total_count = len(links)
@@ -161,8 +193,13 @@ async def task_worker():
                     )
                     continue
 
-                # Скачиваем файл с оригинальным именем
-                filename = await download_with_retry(chat_id, msg_id, progress_callback)
+                # Пытаемся скачать файл
+                filename = await download_with_retry(
+                    chat_id, msg_id, progress_callback, status_msg, index, total_count
+                )
+
+                if filename == "INSUFFICIENT_DISK_SPACE":
+                    continue  # Пропускаем итерацию, если диск полон
 
                 if not filename:
                     await event.respond(
@@ -172,14 +209,16 @@ async def task_worker():
 
                 file_size_gb = os.path.getsize(filename) / (1024 ** 3)
 
+                # Воспроизводим аудио-уведомление сразу после успешного локального сохранения файла
+                play_sound_notification()
+
                 await status_msg.edit(
                     f"📤 **[{index}/{total_count}]** Отправка файла `{os.path.basename(filename)}` ({file_size_gb:.2f} GB) в Избранное..."
                 )
                 
                 try:
-                    # Отправляем файл обратно с оригинальным именем файла на диске
                     await client.send_file("me", filename, force_document=True)
-                    await event.respond(f"✅ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно перезалиты!")
+                    await event.respond(f"✅ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно перезалит!")
                     
                     if os.path.exists(filename):
                         os.remove(filename)
@@ -196,7 +235,7 @@ async def task_worker():
                 await event.respond(
                     f"❌ **[{index}/{total_count}]** Ошибка обработки ссылки `{full_link}`:\n`{e}`"
                 )
-                if filename and os.path.exists(filename):
+                if filename and os.path.exists(filename) and filename != "INSUFFICIENT_DISK_SPACE":
                     try:
                         os.remove(filename)
                     except Exception:
@@ -219,22 +258,10 @@ async def handle_saved_messages(event):
     if not links:
         return
 
-    # Добавляем задачу (событие и извлеченные ссылки) в асинхронную очередь задач
+    # Помещаем задачу в асинхронную очередь безопасности
     await task_queue.put((event, links))
     await event.respond("📥 Ссылки успешно добавлены в очередь обработки. Скрипт скачает файлы последовательно один за другим.")
 
 
 async def main():
     print("⏳ Подключение к Telegram...")
-    await client.start()
-    await client.get_dialogs()
-    
-    # Запускаем бесконечный фоновый воркер для последовательной обработки задач
-    asyncio.create_task(task_worker())
-    
-    print("\n🚀 Все готово! Отправьте ссылку на закрытые/открытые сообщения в свое Избранное (Saved Messages).")
-    await client.run_until_disconnected()
-
-
-if __name__ == "__main__":
-    client.loop.run_until_complete(main())
