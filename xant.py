@@ -6,9 +6,6 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FileReferenceExpiredError, FloodWaitError
 
-# Импортируем оптимизированные методы из fast_telethon
-from FastTelethon import download_file, upload_file
-
 ENV_FILE = ".env"
 
 if not os.path.exists(ENV_FILE):
@@ -42,16 +39,16 @@ client = TelegramClient(
     API_HASH,
     connection_retries=10,
     retry_delay=3,
-    timeout=120
+    timeout=60  # Увеличенный таймаут для стабильного скачивания файлов > 2 ГБ
 )
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
+
+# Глобальная асинхронная очередь задач для последовательной обработки
 task_queue = asyncio.Queue()
 
 
 def extract_all_links(text: str):
-    if not text:
-        return []
     matches = re.finditer(LINK_PATTERN, text)
     results = []
 
@@ -68,47 +65,45 @@ def extract_all_links(text: str):
 
     return results
 
-def play_sound_notification():
-    """Воспроизводит системный звуковой сигнал (BEEP)"""
-    try:
-        print("\a", end="", flush=True)
-    except Exception:
-        pass
-
 
 def get_original_filename(message):
+    """Извлекает оригинальное имя файла или генерирует его на основе типа медиа"""
     if not message or not message.media:
         return None
+        
+    # Попытка получить имя из атрибутов файла Telegram
     if message.file and message.file.name:
         return message.file.name
+        
+    # Если имени нет (например, видео без названия), генерируем понятное имя с правильным расширением
     ext = message.file.ext if message.file and message.file.ext else ".dat"
     return f"telegram_file_{message.chat_id}_{message.id}{ext}"
 
 
 async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3):
-    try:
-        target_msg = await client.get_messages(chat_id, ids=msg_id)
-    except Exception as e:
-        print(f"Ошибка получения сообщения {msg_id} из {chat_id}: {e}")
-        return None
+    """
+    Функция скачивания медиафайла.
+    Принимает chat_id и msg_id для возможности безопасного 
+    перезапроса file_reference при долгой загрузке.
+    """
+    target_msg = await client.get_messages(chat_id, ids=msg_id)
     
     if not target_msg or not target_msg.media:
         return None
 
+    # Получаем оригинальное имя файла
     suggested_filename = get_original_filename(target_msg)
 
     for attempt in range(1, max_retries + 1):
         try:
-            with open(suggested_filename, "wb") as f:
-                await download_file(
-                    client, 
-                    target_msg.media.document, 
-                    f, 
-                    progress_callback=progress_callback
-                )
-            return suggested_filename
+            return await client.download_media(
+                target_msg,
+                file=suggested_filename,  # Передаем оригинальное имя файла для сохранения на диск
+                progress_callback=progress_callback
+            )
         except FileReferenceExpiredError:
             print(f"\n[Внимание] Ссылка устарела на попытке {attempt}. Перезапрашиваем сообщение без кэша...")
+            # ВАЖНО: use_cache=False принудительно обновляет file_reference для больших файлов
             target_msg = await client.get_messages(chat_id, ids=msg_id, use_cache=False)
             if attempt == max_retries:
                 raise
@@ -119,56 +114,36 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
 
 
 async def task_worker():
+    """Фоновый воркер, выполняющий задачи из очереди строго по очереди (один за другим)"""
     while True:
         event, links = await task_queue.get()
         total_count = len(links)
         
         status_msg = await event.respond(
-            f"⏳ В очереди обнаружен пакет ссылок ({total_count} шт.). Начинаю обработку через fast_telethon..."
+            f"⏳ В очереди обнаружен пакет ссылок ({total_count} шт.). Начинаю последовательную обработку..."
         )
 
         for index, (chat_id, msg_id, full_link) in enumerate(links, start=1):
-            # Контейнеры для отслеживания прогресса скачивания и загрузки
-            download_progress = {"last_update": 0, "percent": 0.0}
-            upload_progress = {"last_update": 0, "percent": 0.0}
+            progress_data = {"last_update": 0}
 
-            # 1. Колбэк для отслеживания СКАЧИВАНИЯ
-            def download_callback(current, total):
+            async def progress_callback(current, total):
                 now = time.time()
-                if total > 0:
-                    download_progress["percent"] = (current / total) * 100
-                
-                if now - download_progress["last_update"] > 3 or current == total:
-                    download_progress["last_update"] = now
+                if now - progress_data["last_update"] > 3 or current == total:
+                    progress_data["last_update"] = now
+                    percent = (current / total) * 100
                     mb_current = current / (1024 * 1024)
                     mb_total = total / (1024 * 1024)
                     
-                    asyncio.create_task(
-                        status_msg.edit(
+                    try:
+                        await status_msg.edit(
                             f"⏳ **Обработка [{index}/{total_count}]**\n"
                             f"🔗 `{full_link}`\n"
-                            f"📥 Скачивание: **{download_progress['percent']:.1f}%** ({mb_current:.1f} MB / {mb_total:.1f} MB)"
+                            f"📥 Загрузка: **{percent:.1f}%** ({mb_current:.1f} MB / {mb_total:.1f} MB)"
                         )
-                    )
-
-            # 2. Колбэк для отслеживания ЗАГРУЗКИ (ОТПРАВКИ)
-            def upload_callback(current, total):
-                now = time.time()
-                if total > 0:
-                    upload_progress["percent"] = (current / total) * 100
-                
-                if now - upload_progress["last_update"] > 3 or current == total:
-                    upload_progress["last_update"] = now
-                    mb_current = current / (1024 * 1024)
-                    mb_total = total / (1024 * 1024)
-                    
-                    asyncio.create_task(
-                        status_msg.edit(
-                            f"⏳ **Обработка [{index}/{total_count}]**\n"
-                            f"🔗 `{full_link}`\n"
-                            f"📤 Отправка в Избранное: **{upload_progress['percent']:.1f}%** ({mb_current:.1f} MB / {mb_total:.1f} MB)"
-                        )
-                    )
+                    except FloodWaitError as fwe:
+                        await asyncio.sleep(fwe.seconds)
+                    except Exception:
+                        pass
 
             filename = None
             try:
@@ -186,10 +161,10 @@ async def task_worker():
                     )
                     continue
 
-                # Шаг 1: Скачивание файла
-                filename = await download_with_retry(chat_id, msg_id, download_callback)
+                # Скачиваем файл с оригинальным именем
+                filename = await download_with_retry(chat_id, msg_id, progress_callback)
 
-                if not filename or not os.path.exists(filename):
+                if not filename:
                     await event.respond(
                         f"⚠️ **[{index}/{total_count}]** Файл не найден или сообщение недоступно: `{full_link}`."
                     )
@@ -197,68 +172,69 @@ async def task_worker():
 
                 file_size_gb = os.path.getsize(filename) / (1024 ** 3)
 
-                # Шаг 2: Отгрузка файла на сервера Telegram (с отслеживанием процентов)
                 await status_msg.edit(
-                    f"⏳ **[{index}/{total_count}]** Подготовка к отправке файла `{os.path.basename(filename)}` ({file_size_gb:.2f} GB)..."
+                    f"📤 **[{index}/{total_count}]** Отправка файла `{os.path.basename(filename)}` ({file_size_gb:.2f} GB) в Избранное..."
                 )
                 
                 try:
-                    with open(filename, "rb") as f:
-                        uploaded_file_handle = await upload_file(
-                            client, 
-                            f, 
-                            filename=os.path.basename(filename),
-                            progress_callback=upload_callback  # Добавили отслеживание прогресса отгрузки
-                        )
+                    # Отправляем файл обратно с оригинальным именем файла на диске
+                    await client.send_file("me", filename, force_document=True)
+                    await event.respond(f"✅ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно перезалиты!")
                     
-                    # Финальная отправка структуры сообщения в "Избранное"
-                    await client.send_file("me", uploaded_file_handle, force_document=True)
-                    
-                    # ЗВУКОВОЙ СИГНАЛ: Воспроизводится строго ПОСЛЕ успешной отправки в Избранное
-                    play_sound_notification()
-                    
-                    await event.respond(f"✅ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно перезалит в Избранное!")
-                    
+                    if os.path.exists(filename):
+                        os.remove(filename)
+                        
                 except Exception as upload_err:
                     await event.respond(
-                        f"⚠️ **[{index}/{total_count}]** Файл скачан локально, но Telegram отклонил загрузку.\n"
-                        f"Ошибка: `{upload_err}`\n"
-                        f"Размер: {file_size_gb:.2f} GB. Ограничение аккаунта (2 ГБ обычный / 4 ГБ Premium).\n"
-                        f"📁 Файл сохранен локально: `{filename}`"
+                        f"⚠️ **[{index}/{total_count}]** Файл `{os.path.basename(filename)}` успешно скачан локально, но Telegram отклонил отправку "
+                        f"(Размер: {file_size_gb:.2f} GB).\n"
+                        f"Это ограничение размера вашего аккаунта (2 ГБ обычный / 4 ГБ Premium).\n"
+                        f"📁 Файл сохранен на сервере под именем: `{filename}`"
                     )
-                    filename = None  # Не удаляем файл, оставляем на сервере/ПК пользователя
 
             except Exception as e:
                 await event.respond(
                     f"❌ **[{index}/{total_count}]** Ошибка обработки ссылки `{full_link}`:\n`{e}`"
                 )
-            finally:
                 if filename and os.path.exists(filename):
                     try:
                         os.remove(filename)
                     except Exception:
                         pass
-                        
-        await status_msg.delete()
+
+        await status_msg.edit(
+            f"✅ **Пакет ссылок успешно обработан! ({total_count}/{total_count})**"
+        )
         task_queue.task_done()
 
 
-@client.on(events.NewMessage(pattern=r'.*https://t\.me/.*'))
-async def handle_new_links(event):
-    if not event.is_private:
+@client.on(events.NewMessage(chats="me"))
+async def handle_saved_messages(event):
+    text = event.raw_text
+
+    if "t.me/" not in text:
         return
-        
-    links = extract_all_links(event.text)
-    if links:
-        await task_queue.put((event, links))
-        await event.respond(f"📥 Добавлено в очередь пакетов. Обнаружено ссылок: {len(links)}")
+
+    links = extract_all_links(text)
+    if not links:
+        return
+
+    # Добавляем задачу (событие и извлеченные ссылки) в асинхронную очередь задач
+    await task_queue.put((event, links))
+    await event.respond("📥 Ссылки успешно добавлены в очередь обработки. Скрипт скачает файлы последовательно один за другим.")
 
 
 async def main():
-    client.loop.create_task(task_worker())
+    print("⏳ Подключение к Telegram...")
     await client.start()
-    print("🤖 Скрипт Xant (Fast) успешно запущен и использует многопоточную загрузку!")
+    await client.get_dialogs()
+    
+    # Запускаем бесконечный фоновый воркер для последовательной обработки задач
+    asyncio.create_task(task_worker())
+    
+    print("\n🚀 Все готово! Отправьте ссылку на закрытые/открытые сообщения в свое Избранное (Saved Messages).")
     await client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     import logging
