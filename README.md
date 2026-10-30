@@ -1,8 +1,8 @@
 <div align="center">
 
-# ⚡ Xant - Media Downloader Userbot
+# ⚡ Xant — юзербот для скачивания медиафайлов
 
-**A high-performance asynchronous Telegram userbot designed to batch-download protected media from private channels.**
+**Высокопроизводительный асинхронный юзербот Telegram, разработанный для массового скачивания защищенного контента из приватных каналов.**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Telethon](https://img.shields.io/badge/Telethon-Async-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://docs.telethon.dev/)
@@ -12,32 +12,32 @@
 
 </div>
 
-## 📌 Overview
+## 📌 Обзор
 
-**Xant** is an automated Telegram Userbot script powered by [Telethon](https://github.com/LonamiWebs/Telethon). It bypasses content protection restrictions (`has_protected_content`) on private Telegram channels where saving or forwarding media is prohibited.
+**Xant** это автоматический скрипт-юзербот для Telegram, работающий на базе [Telethon](https://github.com/LonamiWebs/Telethon). Он обходит ограничения защиты контента (`has_protected_content`) в приватных Telegram-каналах, где запрещено сохранение или пересылка медиафайлов.
 
-Simply forward or paste post links into your **Saved Messages**, and **Xant** will process them in sequence, download the files directly from Telegram servers, and send them back to you.
-
----
-
-## ✨ Features
-
-- 🔓 **Bypass Restricted Content:** Download photos, videos, and documents from channels with restricted saving/forwarding.
-- 📦 **Batch Processing:** Send multiple post links in a single message - Xant will queue and process them one by one.
-- 📊 **Real-Time Progress Tracking:** Shows downloading percentage, transferred data (MB), and remaining total size.
-- 🛡️ **Network Resilience:** Built-in connection retry mechanism to handle TCP disconnects and network drops gracefully.
-- ⏱️ **Anti-FloodWait Protection:** Smart status update throttling (2-second interval) to comply with Telegram API rate limits.
-- 🧹 **Auto-Cleanup:** Automatically deletes downloaded temporary files from storage once delivered.
+Просто перешлите или вставьте ссылки на публикации в свои **Избранные сообщения**, и **Xant** обработает их по очереди, скачает файлы напрямую с серверов Telegram на ваше устройство и отправит их вам обратно в **Избранные сообщения**.
 
 ---
 
-## 🛠️ Installation
+## ✨ Возможности
 
-### 1. Clone the Repository
+- 🔓 **Обход защиты контента** скачивание фотографий, видео и документов из каналов с запретом на сохранение и пересылку.
+- 📦 **Пакетная обработка:** отправка нескольких ссылок в одном сообщении — Xant выстроит их в очередь и обработает одну за другой. 
+- 📊 **Отслеживание прогресса в реальном времени:** отображение процента скачивания, и закачивания в **Избранные сообщения**  объема переданных данных (Гб) и общего оставшегося размера.
+- 🛡️ **Устойчивость к сбоям сети:** встроенный механизм повторных попыток подключения для корректной обработки разрывов TCP-соединения и падений сети.
+- ⏱️ **Защита от FloodWait:** умное ограничение частоты обновления статуса (интервал 3 секунды) для соблюдения лимитов Telegram API.
+- 🧹 **Автоочистка:** автоматическое удаление скачанных файлов из хранилища на устройстве только после их доставки вам в **Избранные сообщения**.
+- ⬇ **Скачиваниие файлов** осуществляется в папку **downloads**, которая создается автоматически в директории со скриптом **xant.py**. При старте скрипта, если в папке **downloads** находятся файлы, он спросит, нужно ли закачать файлы в **Избранные сообщения**. Файлы размером более 2 Гб (4 Гб с премиумом Telegram) в **Избранные сообщения** не отправляются -  ограничение Telegram.
+
+---
+
+## 🛠️ Установка
+
+### 1. Клонирование репозитория
 
 ```bash
-git clone https://github.com/Alibrikl/Xant.git
-cd Xant
+git clone https://github.com/Alibrikl/Xant.git && cd Xant
 ```
 ### 2. Install Dependencies
 ```bash
