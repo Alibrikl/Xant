@@ -13,8 +13,6 @@ from telethon.errors import FileReferenceExpiredError, FloodWaitError
 from telethon.tl import types
 from telethon.tl.types import DocumentAttributeFilename
 
-import FastTelethon
-
 ENV_FILE = ".env"
 DOWNLOAD_DIR = "downloads"
 NOTIFY_SOUND = "notify.ogg"
@@ -23,8 +21,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
 
-CONCURRENT_DOWNLOADS = 3   # одновременно качаемых файлов
-CLEANUP_DELAY = 10         # [NEW] секунд перед удалением служебных сообщений
+CONCURRENT_DOWNLOADS = 3
+CLEANUP_DELAY = 10
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -57,6 +55,8 @@ cancel_flag = {"cancel": False}
 
 batches: dict[int, dict] = {}
 batch_counter = {"id": 0}
+
+upload_lock = asyncio.Lock()
 
 
 # ---------- Звук ----------
@@ -93,7 +93,6 @@ async def play_sound():
 
 # ---------- Отложенное удаление ----------
 async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
-    """Удаляет сообщения через delay секунд (не блокирует воркер)."""
     if delay > 0:
         await asyncio.sleep(delay)
     for m in messages:
@@ -310,13 +309,18 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         file_size_gb = os.path.getsize(filename) / (1024 ** 3)
         display_name = os.path.basename(filename)
 
-        with open(filename, "rb") as f:
-            file_handle = await FastTelethon.upload_file(
-                client=client, file=f, progress_callback=upload_cb,
+        async with upload_lock:
+            await status_msg.edit(
+                f"📤 **Отправка**\n"
+                f"📁 `{display_name}`\n"
+                f"⏸ Ожидание очереди upload..."
             )
             await client.send_file(
-                "me", file_handle, force_document=True,
+                "me",
+                filename,
+                force_document=True,
                 attributes=[DocumentAttributeFilename(display_name)],
+                progress_callback=upload_cb,
             )
 
         await status_msg.edit(f"✅ `{display_name}` ({file_size_gb:.2f} GB) перезалит!")
@@ -394,10 +398,73 @@ async def _maybe_finish_batch(batch_id: int):
                 print(f"[notify] Не удалось отправить {NOTIFY_SOUND}: {e}")
         asyncio.create_task(play_sound())
 
-    # [NEW] отложенное удаление служебных сообщений
     asyncio.create_task(_delete_later(*b["to_delete"]))
-
     batches.pop(batch_id, None)
+
+
+# ---------- Отправка старых файлов из downloads/ ----------
+async def upload_existing_downloads():
+    """Отправляет все файлы из downloads/ в Избранное по одному."""
+    files = [
+        os.path.join(DOWNLOAD_DIR, f)
+        for f in os.listdir(DOWNLOAD_DIR)
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+    ]
+    if not files:
+        return
+
+    total = len(files)
+    print(f"\n📤 Отправка {total} файл(ов) из {DOWNLOAD_DIR}/ в Избранное...")
+
+    status = await client.send_message(
+        "me", f"📤 Отправка {total} старых файлов из `{DOWNLOAD_DIR}/`..."
+    )
+
+    ok = fail = 0
+    for i, path in enumerate(files, start=1):
+        name = os.path.basename(path)
+        size_gb = os.path.getsize(path) / (1024 ** 3)
+        progress_data = {"last_update": 0}
+
+        async def cb(current, total_bytes):
+            now = time.time()
+            if now - progress_data["last_update"] > 3 or current == total_bytes:
+                progress_data["last_update"] = now
+                percent = (current / total_bytes) * 100 if total_bytes else 0
+                try:
+                    await status.edit(
+                        f"📤 **Отправка старых файлов [{i}/{total}]**\n"
+                        f"📁 `{name}`\n"
+                        f"📊 **{percent:.1f}%** "
+                        f"({human_size(current)} / {human_size(total_bytes)})"
+                    )
+                except FloodWaitError as fwe:
+                    await asyncio.sleep(fwe.seconds)
+                except Exception:
+                    pass
+
+        try:
+            async with upload_lock:
+                await client.send_file(
+                    "me",
+                    path,
+                    force_document=True,
+                    attributes=[DocumentAttributeFilename(name)],
+                    progress_callback=cb,
+                )
+            os.remove(path)
+            ok += 1
+            print(f"  ✅ [{i}/{total}] {name} ({size_gb:.2f} GB)")
+        except Exception as e:
+            fail += 1
+            print(f"  ❌ [{i}/{total}] {name}: {e}")
+
+    await status.edit(
+        f"✅ **Старые файлы обработаны**\n"
+        f"├ Успешно: {ok}\n"
+        f"└ Ошибок: {fail}"
+    )
+    asyncio.create_task(play_sound())
 
 
 # ---------- Обработчик сообщений ----------
@@ -428,7 +495,8 @@ async def handle_saved_messages(event):
             f"📊 **Статистика**\n"
             f"├ Ссылок в очереди: {link_queue.qsize()}\n"
             f"├ Активных пачек: {len(batches)}\n"
-            f"├ Одновременных воркеров: {CONCURRENT_DOWNLOADS}\n"
+            f"├ Одновременных скачиваний: {CONCURRENT_DOWNLOADS}\n"
+            f"├ Upload: по одному файлу (Lock)\n"
             f"└ Обработано уникальных: {len(processed)}"
         )
         return
@@ -445,7 +513,6 @@ async def handle_saved_messages(event):
     batches[batch_id] = {
         "event": event, "total": len(links),
         "ok": 0, "skip": 0, "fail": 0,
-        # [NEW] сообщение с ссылками тоже пойдёт под удаление
         "to_delete": [event],
     }
     cancel_flag["cancel"] = False
@@ -455,7 +522,7 @@ async def handle_saved_messages(event):
 
     info_msg = await event.respond(
         f"📥 Добавлено ссылок: {len(links)}. "
-        f"Одновременно качается до {CONCURRENT_DOWNLOADS}. "
+        f"Скачивание: до {CONCURRENT_DOWNLOADS} параллельно, upload: по одному. "
         f"Всего в очереди: {link_queue.qsize()}"
     )
     batches[batch_id]["to_delete"].append(info_msg)
@@ -463,19 +530,41 @@ async def handle_saved_messages(event):
 
 # ---------- Запуск ----------
 async def main():
+    # [NEW] проверяем downloads/ ДО подключения (input не блокирует loop)
+    files_in_downloads = [
+        f for f in os.listdir(DOWNLOAD_DIR)
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+    ]
+    send_old = False
+    if files_in_downloads:
+        print(f"\n📂 В папке `{DOWNLOAD_DIR}/` найдено {len(files_in_downloads)} файл(ов):")
+        for f in files_in_downloads[:20]:
+            size_mb = os.path.getsize(os.path.join(DOWNLOAD_DIR, f)) / (1024 ** 2)
+            print(f"   • {f} ({size_mb:.1f} MB)")
+        if len(files_in_downloads) > 20:
+            print(f"   … и ещё {len(files_in_downloads) - 20}")
+        answer = input("\nОтправить их в Избранное? [y/N]: ").strip().lower()
+        send_old = answer in ("y", "yes", "да", "д")
+
     print("⏳ Подключение к Telegram...")
     await client.start()
     await client.get_dialogs()
+
+    # [NEW] отправляем старые файлы, если пользователь согласился
+    if send_old:
+        await upload_existing_downloads()
 
     workers = [
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
     ]
-    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
+    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS} (upload — по одному)")
 
     print(
-        f"\n🚀 Готово! Одновременных загрузок: {CONCURRENT_DOWNLOADS}.\n"
-        f"Служебные сообщения удаляются через {CLEANUP_DELAY} сек после пачки.\n"
+        f"\n🚀 Готово!\n"
+        f"├ Скачивание: до {CONCURRENT_DOWNLOADS} параллельно\n"
+        f"├ Отправка: строго по одному файлу\n"
+        f"└ Служебные сообщения удаляются через {CLEANUP_DELAY} сек\n"
         f"Команды: /stop, /clear, /stats"
     )
     try:
