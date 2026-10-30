@@ -404,7 +404,7 @@ async def _maybe_finish_batch(batch_id: int):
 
 # ---------- Отправка старых файлов из downloads/ ----------
 async def upload_existing_downloads():
-    """Отправляет все файлы из downloads/ в Избранное по одному."""
+    """Отправляет все файлы из downloads в Избранное по одному."""
     files = [
         os.path.join(DOWNLOAD_DIR, f)
         for f in os.listdir(DOWNLOAD_DIR)
@@ -417,7 +417,7 @@ async def upload_existing_downloads():
     print(f"\n📤 Отправка {total} файл(ов) из {DOWNLOAD_DIR}/ в Избранное...")
 
     status = await client.send_message(
-        "me", f"📤 Отправка {total} старых файлов из `{DOWNLOAD_DIR}/`..."
+        "me", f"📤 Отправка {total} файлов из `{DOWNLOAD_DIR}/`..."
     )
 
     ok = fail = 0
@@ -433,7 +433,7 @@ async def upload_existing_downloads():
                 percent = (current / total_bytes) * 100 if total_bytes else 0
                 try:
                     await status.edit(
-                        f"📤 **Отправка старых файлов [{i}/{total}]**\n"
+                        f"📤 **Отправка файлов [{i}/{total}]**\n"
                         f"📁 `{name}`\n"
                         f"📊 **{percent:.1f}%** "
                         f"({human_size(current)} / {human_size(total_bytes)})"
@@ -460,7 +460,7 @@ async def upload_existing_downloads():
             print(f"  ❌ [{i}/{total}] {name}: {e}")
 
     await status.edit(
-        f"✅ **Старые файлы обработаны**\n"
+        f"✅ **Скачанные файлы обработаны**\n"
         f"├ Успешно: {ok}\n"
         f"└ Ошибок: {fail}"
     )
@@ -476,7 +476,7 @@ async def handle_saved_messages(event):
     if cmd == "/stop":
         cancel_flag["cancel"] = True
         await event.respond(
-            "⛔ Новые ссылки будут пропущены. Уже идущие загрузки продолжатся."
+            "⛔ Новые ссылки будут пропущены. Уже скачиваемые загрузки продолжатся."
         )
         return
 
@@ -543,7 +543,7 @@ async def main():
             print(f"   • {f} ({size_mb:.1f} MB)")
         if len(files_in_downloads) > 20:
             print(f"   … и ещё {len(files_in_downloads) - 20}")
-        answer = input("\nОтправить их в Избранное? [y/N]: ").strip().lower()
+        answer = input("\nОтправить их в Избранное? [y/n]: ").strip().lower()
         send_old = answer in ("y", "yes", "да", "д")
 
     print("⏳ Подключение к Telegram...")
