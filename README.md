@@ -14,7 +14,7 @@
 
 ## 📌 Обзор
 
-**Xant** это автоматический скрипт-юзербот для Telegram, работающий на базе [Telethon](https://github.com/LonamiWebs/Telethon). Он обходит ограничения защиты контента (`has_protected_content`) в приватных Telegram-каналах, где запрещено сохранение или пересылка медиафайлов.
+**Xant** это автоматический скрипт-юзербот для Telegram, работающий на базе [Telethon](https://github.com/LonamiWebs/Telethon). Он обходит ограничения защиты контента в приватных Telegram-каналах, где запрещено сохранение или пересылка медиафайлов.
 
 Просто перешлите или вставьте ссылки на публикации в свои **Избранные сообщения**, и **Xant** обработает их по очереди, скачает файлы напрямую с серверов Telegram на ваше устройство и отправит их вам обратно в **Избранные сообщения**.
 
@@ -39,77 +39,76 @@
 ```bash
 git clone https://github.com/Alibrikl/Xant.git && cd Xant
 ```
-### 2. Install Dependencies
+### 2. Установка зависимостей
 ```bash
 pip install -r requirements.txt
 ```
-### 3. Standard Run
+### 3. Запуск
 ```bash
 python xant.py
 ```
-### 3.1 Running on Android (Termux)
+### Запуск на Android 🤖(Termux)
 ```bash
 pkg update && pkg upgrade -y
 pkg install python git -y
-git clone https://github.com/Alibrikl/Xant.git
-cd Xant
+git clone https://github.com/Alibrikl/Xant.git && cd Xant
 pip install -r requirements.txt
 python xant.py
 ```
 
 ---
 
-## ⚙️ Configuration & First Launch
+## ⚙️ Настройка & первый запуск 
 
-Xant features an interactive initial setup. You don't need to manually create or edit any environment files before running the project.
+В Xant предусмотрена интерактивная первичная настройка. Вам не нужно вручную создавать или редактировать файлы окружения перед запуском.
 
-### 1. Get Your API Credentials
-
-1. Log in with your Telegram phone number at [my.telegram.org](https://my.telegram.org).
-2. Go to **API development tools**.
-3. Create a new application (fill in any title and short name, e.g., `XantApp`).
-4. Copy your **`api_id`** and **`api_hash`**.
+### 1.Получение учетных данных API Telegram  
+Войдите со своим номером телефона Telegram на сайте [my.telegram.org](https://my.telegram.org).
+2. Перейдите в раздел **API development tools**.
+3. Создайте новое приложение (заполните любое название и короткое имя, например, XantApp).
+4. Скопируйте ваши **`api_id`** и **`api_hash`**.
 
 ---
 
-### 2. Run Initial Setup
+### 2. Запуск первоначальной настройки
 
-Start the userbot using Python:
+Запустите юзербота с помощью Python:
 
 ```bash
 python xant.py
 ```
-On your first run, Xant will prompt you to enter your API credentials directly in the terminal:
+При первом запуске Xant предложит вам ввести учетные данные API прямо в терминале:
 ```bash
 ==================================================
-🚀 Welcome to Xant Userbot Setup!
-Get your API credentials from https://my.telegram.org
+🚀 Добро пожаловать в Xant
+Получите свои учетные данные API https://my.telegram.org
 ==================================================
-Enter your TELEGRAM_API_ID:
-Enter your TELEGRAM_API_HASH:
+Введите свой TELEGRAM_API_ID:
+Введите свой TELEGRAM_API_HASH:
 ```
 
 ---
 
-## 📖 How to Use
+## 📖 Как использовать
 
-1. **Start the Userbot:** Launch `Xant` on your local PC, Termux, or server.
-2. **Open Saved Messages:** In your Telegram app, go to your **Saved Messages** (`me`).
-3. **Send Links:** Paste one or multiple Telegram post links (one per line or separated by spaces):
+1. **Запустите юзербота:** перейдите в директорию Xant на своем ПК, в Termux и выполните: python xant.py.
+2. **Скапируйте ссылку:** в приложении Telegram перейдите в закрытый канал и скопируйте ссылку у файла.
+3. **Откройте «Избранное»:** в приложении Telegram перейдите в свои «Избранные сообщения».
+4. **Отправьте ссылки:** вставьте одну или несколько ссылок на посты в Telegram (по одной ссылке на строку или через пробел):
 
-```text
-https://t.me/c/1234567890/100 <- example
-https://t.me/c/1234567890/101 <- example
-https://t.me/c/1234567890/102 <- example
+```пример
+https://t.me/c/1234567890/100 
+https://t.me/c/1234567890/101 
+https://t.me/c/1234567890/102 
 ```
 ---
 
-## ⚠️ Disclaimer
+## ⚠️ Отказ от ответственности
 
-> **IMPORTANT NOTICE:** This software is provided strictly for educational, research, and personal archiving purposes only.
+> **ВАЖНОЕ ПРИМЕЧАНИЕ:** Данное программное обеспечение предоставляется исключительно в ознакомительных, исследовательских целях и для личного архивирования.
 
-* **Compliance with Terms of Service:** Users are solely responsible for ensuring that their use of **Xant** complies with Telegram’s [Terms of Service](https://telegram.org/tos) and relevant local regulations.
-* **Copyright & Content Protection:** Do not use this tool to download, duplicate, or redistribute copyrighted media without explicit permission from the original content creator or rights holder.
-* **Limitation of Liability:** The author/developer assumes **no liability or responsibility** for any account bans, suspensions, data loss, or legal consequences resulting from the deployment or misuse of this script.
+* **Соблюдение Условий предоставления услуг:** Пользователи несут единоличную ответственность за то, чтобы использование ими **Xant** не нарушало Условия предоставления услуг Telegram [Terms of Service](https://telegram.org/tos) и соответствующие местные законы.
+* **Авторские права и защита контента:** Не используйте этот инструмент для скачивания, дублирования или распространения защищенного авторским правом медиаконтента без явного разрешения автора или правообладателя.
+* **Ограничение ответственности:** Автор/разработчик не несет **никакой ответственности** за возможные блокировки аккаунтов, приостановку их действия, блокировку в закрытом канале, потерю данных или юридические последствия, вызванные развертыванием или неправильным использованием данного скрипта.
 
-*By running this project, you acknowledge and accept full legal responsibility for your actions.*
+*Запуская этот проект, вы подтверждаете и принимаете на себя полную юридическую ответственность за свои действия.*
