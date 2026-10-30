@@ -9,7 +9,11 @@ import mimetypes
 import subprocess
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import FileReferenceExpiredError, FloodWaitError
+from telethon.errors import (
+    FileReferenceExpiredError,
+    FloodWaitError,
+    MessageNotModifiedError,
+)
 from telethon.tl import types
 from telethon.tl.types import DocumentAttributeFilename
 
@@ -22,7 +26,10 @@ LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
 
 CONCURRENT_DOWNLOADS = 3
-CLEANUP_DELAY = 10
+CLEANUP_DELAY = 10   # [FIX] итог удаляется через 10 секунд
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"}
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -45,7 +52,10 @@ except (TypeError, ValueError):
     print("❌ Ошибка: Неверный TELEGRAM_API_ID в файле .env.")
     exit(1)
 
-client = TelegramClient("user_session", API_ID, API_HASH, connection_retries=10, retry_delay=3, timeout=60)
+client = TelegramClient(
+    "user_session", API_ID, API_HASH,
+    connection_retries=10, retry_delay=3, timeout=60,
+)
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 
@@ -68,7 +78,10 @@ def _play_sound_sync():
             return
         if sys.platform == "darwin":
             if shutil.which("afplay"):
-                subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], check=False, timeout=3)
+                subprocess.run(
+                    ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                    check=False, timeout=3,
+                )
                 return
         for player, sound in (
             ("paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"),
@@ -237,14 +250,44 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
             await asyncio.sleep(2 * attempt)
 
 
+# ---------- Определение типа и отправка ----------
+def _get_send_kind(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    return "document"
+
+
+async def _send_media(chat, path: str, display_name: str, progress_cb=None):
+    """Отправляет файл как видео/аудио/документ. Метаданные определяет Telethon (hachoir)."""
+    kind = _get_send_kind(path)
+
+    if kind == "video":
+        # Без attributes — Telethon сам определит duration, w, h через hachoir
+        await client.send_video(chat, path, progress_callback=progress_cb)
+    elif kind == "audio":
+        # Без attributes — Telethon сам извлечёт title, performer, duration из тегов
+        await client.send_file(chat, path, progress_callback=progress_cb)
+    else:
+        await client.send_file(
+            chat, path,
+            force_document=True,
+            attributes=[DocumentAttributeFilename(display_name)],
+            progress_callback=progress_cb,
+        )
+
+
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
     batch = batches[batch_id]
-
     key = (chat_id, msg_id)
+
     if key in processed:
         await batch["event"].respond(f"♻️ Уже обработано: `{full_link}`")
         return "skip"
+    processed.add(key)
 
     status_msg = await batch["event"].respond(f"⏳ Старт: `{full_link}`")
 
@@ -263,6 +306,8 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"🔗 `{full_link}`\n"
                     f"📥 **{percent:.1f}%** ({human_size(current)} / {human_size(total)})"
                 )
+            except MessageNotModifiedError:
+                pass
             except FloodWaitError as fwe:
                 await asyncio.sleep(fwe.seconds)
             except Exception:
@@ -279,6 +324,8 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"📁 `{os.path.basename(filename or '')}`\n"
                     f"📊 **{percent:.1f}%** ({human_size(current)} / {human_size(total)})"
                 )
+            except MessageNotModifiedError:
+                pass
             except FloodWaitError as fwe:
                 await asyncio.sleep(fwe.seconds)
             except Exception:
@@ -288,6 +335,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         target_msg = await client.get_messages(chat_id, ids=msg_id)
         if not target_msg or not target_msg.media:
             await status_msg.edit(f"⚠️ Нет медиа: `{full_link}`")
+            processed.discard(key)
             return "fail"
 
         file_size = target_msg.file.size if target_msg.file else 0
@@ -295,6 +343,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             await status_msg.edit(
                 f"⚠️ Файл слишком большой ({human_size(file_size)} > 4 ГБ). Пропуск."
             )
+            processed.discard(key)
             return "fail"
         if file_size > LIMIT_FREE:
             await status_msg.edit(
@@ -304,34 +353,38 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         filename = await download_with_retry(chat_id, msg_id, download_cb)
         if not filename:
             await status_msg.edit(f"⚠️ Не удалось скачать: `{full_link}`")
+            processed.discard(key)
             return "fail"
 
         file_size_gb = os.path.getsize(filename) / (1024 ** 3)
         display_name = os.path.basename(filename)
 
         async with upload_lock:
-            await status_msg.edit(
-                f"📤 **Отправка**\n"
-                f"📁 `{display_name}`\n"
-                f"⏸ Ожидание очереди upload..."
-            )
-            await client.send_file(
-                "me",
-                filename,
-                force_document=True,
-                attributes=[DocumentAttributeFilename(display_name)],
-                progress_callback=upload_cb,
-            )
+            try:
+                await status_msg.edit(
+                    f"📤 **Отправка**\n"
+                    f"📁 `{display_name}`\n"
+                    f"⏸ Ожидание очереди upload..."
+                )
+            except Exception:
+                pass
+            await _send_media("me", filename, display_name, upload_cb)
 
-        await status_msg.edit(f"✅ `{display_name}` ({file_size_gb:.2f} GB) перезалит!")
-        processed.add(key)
+        try:
+            await status_msg.edit(f"✅ `{display_name}` ({file_size_gb:.2f} GB) перезалит!")
+        except Exception:
+            pass
         asyncio.create_task(play_sound())
         if os.path.exists(filename):
             os.remove(filename)
         return "ok"
 
     except Exception as e:
-        await status_msg.edit(f"❌ Ошибка `{full_link}`:\n`{e}`")
+        try:
+            await status_msg.edit(f"❌ Ошибка `{full_link}`:\n`{e}`")
+        except Exception:
+            pass
+        processed.discard(key)
         if filename and os.path.exists(filename):
             try:
                 os.remove(filename)
@@ -367,7 +420,10 @@ async def link_worker(worker_id: int):
                 await _maybe_finish_batch(batch_id)
 
         finally:
-            link_queue.task_done()
+            try:
+                link_queue.task_done()
+            except ValueError:
+                pass
 
 
 async def _maybe_finish_batch(batch_id: int):
@@ -377,6 +433,9 @@ async def _maybe_finish_batch(batch_id: int):
     done = b["ok"] + b["skip"] + b["fail"]
     if done < b["total"]:
         return
+    if b.get("finished"):
+        return
+    b["finished"] = True
 
     summary_msg = await b["event"].respond(
         f"✅ **Пачка обработана!**\n"
@@ -404,11 +463,10 @@ async def _maybe_finish_batch(batch_id: int):
 
 # ---------- Отправка старых файлов из downloads/ ----------
 async def upload_existing_downloads():
-    """Отправляет все файлы из downloads в Избранное по одному."""
     files = [
         os.path.join(DOWNLOAD_DIR, f)
         for f in os.listdir(DOWNLOAD_DIR)
-        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f)) and f != NOTIFY_SOUND
     ]
     if not files:
         return
@@ -424,20 +482,23 @@ async def upload_existing_downloads():
     for i, path in enumerate(files, start=1):
         name = os.path.basename(path)
         size_gb = os.path.getsize(path) / (1024 ** 3)
-        progress_data = {"last_update": 0}
+        pd = {"last_update": 0}
 
-        async def cb(current, total_bytes):
+        async def cb(current, total_bytes, *, _i=i, _name=name,
+                     _total=total, _pd=pd, _status=status):
             now = time.time()
-            if now - progress_data["last_update"] > 3 or current == total_bytes:
-                progress_data["last_update"] = now
+            if now - _pd["last_update"] > 3 or current == total_bytes:
+                _pd["last_update"] = now
                 percent = (current / total_bytes) * 100 if total_bytes else 0
                 try:
-                    await status.edit(
-                        f"📤 **Отправка файлов [{i}/{total}]**\n"
-                        f"📁 `{name}`\n"
+                    await _status.edit(
+                        f"📤 **Отправка файлов [{_i}/{_total}]**\n"
+                        f"📁 `{_name}`\n"
                         f"📊 **{percent:.1f}%** "
                         f"({human_size(current)} / {human_size(total_bytes)})"
                     )
+                except MessageNotModifiedError:
+                    pass
                 except FloodWaitError as fwe:
                     await asyncio.sleep(fwe.seconds)
                 except Exception:
@@ -445,13 +506,7 @@ async def upload_existing_downloads():
 
         try:
             async with upload_lock:
-                await client.send_file(
-                    "me",
-                    path,
-                    force_document=True,
-                    attributes=[DocumentAttributeFilename(name)],
-                    progress_callback=cb,
-                )
+                await _send_media("me", path, name, cb)
             os.remove(path)
             ok += 1
             print(f"  ✅ [{i}/{total}] {name} ({size_gb:.2f} GB)")
@@ -459,11 +514,14 @@ async def upload_existing_downloads():
             fail += 1
             print(f"  ❌ [{i}/{total}] {name}: {e}")
 
-    await status.edit(
-        f"✅ **Скачанные файлы обработаны**\n"
-        f"├ Успешно: {ok}\n"
-        f"└ Ошибок: {fail}"
-    )
+    try:
+        await status.edit(
+            f"✅ **Скачанные файлы обработаны**\n"
+            f"├ Успешно: {ok}\n"
+            f"└ Ошибок: {fail}"
+        )
+    except Exception:
+        pass
     asyncio.create_task(play_sound())
 
 
@@ -513,6 +571,7 @@ async def handle_saved_messages(event):
     batches[batch_id] = {
         "event": event, "total": len(links),
         "ok": 0, "skip": 0, "fail": 0,
+        "finished": False,
         "to_delete": [event],
     }
     cancel_flag["cancel"] = False
@@ -530,10 +589,9 @@ async def handle_saved_messages(event):
 
 # ---------- Запуск ----------
 async def main():
-    # [NEW] проверяем downloads/ ДО подключения (input не блокирует loop)
     files_in_downloads = [
         f for f in os.listdir(DOWNLOAD_DIR)
-        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f)) and f != NOTIFY_SOUND
     ]
     send_old = False
     if files_in_downloads:
@@ -550,7 +608,6 @@ async def main():
     await client.start()
     await client.get_dialogs()
 
-    # [NEW] отправляем старые файлы, если пользователь согласился
     if send_old:
         await upload_existing_downloads()
 
@@ -563,9 +620,9 @@ async def main():
     print(
         f"\n🚀 Готово!\n"
         f"├ Скачивание: до {CONCURRENT_DOWNLOADS} параллельно\n"
-        f"├ Отправка: строго по одному файлу\n"
-        f"└ Служебные сообщения удаляются через {CLEANUP_DELAY} сек\n"
-        f"Команды: /stop, /clear, /stats"
+        f"├ Отправка: видео/аудио/документ (метаданные через hachoir)\n"
+        f"├ Итог пачки удаляется через {CLEANUP_DELAY} сек\n"
+        f"└ Команды: /stop, /clear, /stats"
     )
     try:
         await client.run_until_disconnected()
