@@ -15,7 +15,11 @@ from telethon.errors import (
     MessageNotModifiedError,
 )
 from telethon.tl import types
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import (
+    DocumentAttributeFilename,
+    DocumentAttributeAudio,
+    DocumentAttributeVideo,
+)
 
 ENV_FILE = ".env"
 DOWNLOAD_DIR = "downloads"
@@ -26,7 +30,7 @@ LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
 
 CONCURRENT_DOWNLOADS = 3
-CLEANUP_DELAY = 10   # [FIX] итог удаляется через 10 секунд
+CLEANUP_DELAY = 10
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"}
@@ -120,13 +124,20 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
 # ---------- Имена файлов ----------
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _MULTI_UNDERSCORE = re.compile(r'_+')
-_MAX_NAME_LEN = 200
+_MAX_NAME_BYTES = 230   # [FIX #5] запас под суффикс " (N)" от unique_path
 
 
 def _sanitize(name: str) -> str:
     name = _INVALID_CHARS.sub("_", name)
     name = _MULTI_UNDERSCORE.sub("_", name)
     return name.strip(" ._")
+
+
+def _truncate_to_bytes(s: str, max_bytes: int) -> str:
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return s
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _detect_extension(message) -> str:
@@ -150,7 +161,9 @@ def _detect_extension(message) -> str:
                 if isinstance(attr, types.DocumentAttributeAnimated):
                     return ".mp4"
                 if isinstance(attr, types.DocumentAttributeFilename):
-                    return ""
+                    _, ext = os.path.splitext(attr.file_name or "")
+                    if ext:
+                        return ext.lower()
     return ".bin"
 
 
@@ -185,11 +198,7 @@ def build_filename(message) -> str:
     if not ext:
         ext = _detect_extension(message) or ".bin"
     filename = f"{base}_{message.id}{ext}"
-    if len(filename) > _MAX_NAME_LEN:
-        suffix = f"_{message.id}{ext}"
-        keep = _MAX_NAME_LEN - len(suffix)
-        base = base[:max(keep, 10)]
-        filename = f"{base}{suffix}"
+    filename = _truncate_to_bytes(filename, _MAX_NAME_BYTES)
     return filename
 
 
@@ -250,6 +259,54 @@ async def download_with_retry(chat_id, msg_id, progress_callback, max_retries=3)
             await asyncio.sleep(2 * attempt)
 
 
+# ---------- Метаданные через hachoir ----------
+def _to_seconds(value) -> int:
+    """hachoir может вернуть int/float/timedelta — приводим к секундам."""
+    if value is None:
+        return 0
+    if hasattr(value, "total_seconds"):
+        return int(value.total_seconds())
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _video_meta_sync(path: str):
+    """Возвращает (duration, width, height). 0,0,0 если hachoir недоступен/ошибка."""
+    try:
+        from hachoir.metadata import extractMetadata
+        from hachoir.parser import createParser
+        parser = createParser(path)
+        if not parser:
+            return 0, 0, 0
+        meta = extractMetadata(parser)
+        if not meta:
+            return 0, 0, 0
+        d = _to_seconds(meta.get("duration"))
+        w = int(meta.get("width") or 0)
+        h = int(meta.get("height") or 0)
+        return d, w, h
+    except Exception:
+        return 0, 0, 0
+
+
+def _audio_meta_sync(path: str) -> int:
+    """Возвращает duration в секундах. 0 если hachoir недоступен/ошибка."""
+    try:
+        from hachoir.metadata import extractMetadata
+        from hachoir.parser import createParser
+        parser = createParser(path)
+        if not parser:
+            return 0
+        meta = extractMetadata(parser)
+        if not meta:
+            return 0
+        return _to_seconds(meta.get("duration"))
+    except Exception:
+        return 0
+
+
 # ---------- Определение типа и отправка ----------
 def _get_send_kind(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
@@ -261,15 +318,33 @@ def _get_send_kind(path: str) -> str:
 
 
 async def _send_media(chat, path: str, display_name: str, progress_cb=None):
-    """Отправляет файл как видео/аудио/документ. Метаданные определяет Telethon (hachoir)."""
     kind = _get_send_kind(path)
 
     if kind == "video":
-        # Без attributes — Telethon сам определит duration, w, h через hachoir
-        await client.send_video(chat, path, progress_callback=progress_cb)
+        d, w, h = await asyncio.to_thread(_video_meta_sync, path)
+        if w > 0 and h > 0:
+            await client.send_file(
+                chat, path,
+                attributes=[DocumentAttributeVideo(
+                    duration=d, w=w, h=h, supports_streaming=True,
+                )],
+                progress_callback=progress_cb,
+            )
+            return
+        # fallback: не смогли определить размеры — отправляем как документ
+        await client.send_file(
+            chat, path,
+            force_document=True,
+            attributes=[DocumentAttributeFilename(display_name)],
+            progress_callback=progress_cb,
+        )
     elif kind == "audio":
-        # Без attributes — Telethon сам извлечёт title, performer, duration из тегов
-        await client.send_file(chat, path, progress_callback=progress_cb)
+        d = await asyncio.to_thread(_audio_meta_sync, path)
+        await client.send_file(
+            chat, path,
+            attributes=[DocumentAttributeAudio(duration=d)],
+            progress_callback=progress_cb,
+        )
     else:
         await client.send_file(
             chat, path,
@@ -281,9 +356,11 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None):
 
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
-    batch = batches[batch_id]
-    key = (chat_id, msg_id)
+    batch = batches.get(batch_id)
+    if batch is None:
+        return "fail"
 
+    key = (chat_id, msg_id)
     if key in processed:
         await batch["event"].respond(f"♻️ Уже обработано: `{full_link}`")
         return "skip"
@@ -336,6 +413,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         if not target_msg or not target_msg.media:
             await status_msg.edit(f"⚠️ Нет медиа: `{full_link}`")
             processed.discard(key)
+            asyncio.create_task(_delete_later(status_msg))
             return "fail"
 
         file_size = target_msg.file.size if target_msg.file else 0
@@ -344,6 +422,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 f"⚠️ Файл слишком большой ({human_size(file_size)} > 4 ГБ). Пропуск."
             )
             processed.discard(key)
+            asyncio.create_task(_delete_later(status_msg))
             return "fail"
         if file_size > LIMIT_FREE:
             await status_msg.edit(
@@ -354,18 +433,22 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         if not filename:
             await status_msg.edit(f"⚠️ Не удалось скачать: `{full_link}`")
             processed.discard(key)
+            asyncio.create_task(_delete_later(status_msg))
             return "fail"
 
         file_size_gb = os.path.getsize(filename) / (1024 ** 3)
         display_name = os.path.basename(filename)
 
         async with upload_lock:
+            # [FIX #4] явный MessageNotModifiedError вокруг "Ожидание очереди"
             try:
                 await status_msg.edit(
                     f"📤 **Отправка**\n"
                     f"📁 `{display_name}`\n"
                     f"⏸ Ожидание очереди upload..."
                 )
+            except MessageNotModifiedError:
+                pass
             except Exception:
                 pass
             await _send_media("me", filename, display_name, upload_cb)
@@ -377,6 +460,9 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         asyncio.create_task(play_sound())
         if os.path.exists(filename):
             os.remove(filename)
+
+        # [FIX #2] удаляем статус успеха через CLEANUP_DELAY
+        asyncio.create_task(_delete_later(status_msg))
         return "ok"
 
     except Exception as e:
@@ -390,6 +476,8 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 os.remove(filename)
             except Exception:
                 pass
+        # [FIX #2] удаляем статус ошибки через CLEANUP_DELAY
+        asyncio.create_task(_delete_later(status_msg))
         return "fail"
 
 
@@ -446,10 +534,13 @@ async def _maybe_finish_batch(batch_id: int):
     b["to_delete"].append(summary_msg)
 
     if b["ok"] > 0:
-        if os.path.exists(NOTIFY_SOUND):
+        if (os.path.exists(NOTIFY_SOUND)
+                and os.path.getsize(NOTIFY_SOUND) < 1024 * 1024):
             try:
+                # [FIX #3] voice_note=False — чтобы caption отображался
                 notify_msg = await client.send_file(
-                    "me", NOTIFY_SOUND, voice_note=True,
+                    "me", NOTIFY_SOUND,
+                    voice_note=False,
                     caption=f"🔔 Пачка обработана: {b['ok']} файл(ов)",
                 )
                 b["to_delete"].append(notify_msg)
@@ -522,6 +613,7 @@ async def upload_existing_downloads():
         )
     except Exception:
         pass
+    asyncio.create_task(_delete_later(status))
     asyncio.create_task(play_sound())
 
 
@@ -534,8 +626,14 @@ async def handle_saved_messages(event):
     if cmd == "/stop":
         cancel_flag["cancel"] = True
         await event.respond(
-            "⛔ Новые ссылки будут пропущены. Уже скачиваемые загрузки продолжатся."
+            "⛔ Новые ссылки будут пропущены. Уже скачиваемые загрузки продолжатся.\n"
+            "Отправить /resume, чтобы возобновить обработку новых ссылок."
         )
+        return
+
+    if cmd == "/resume":
+        cancel_flag["cancel"] = False
+        await event.respond("▶️ Обработка новых ссылок возобновлена.")
         return
 
     if cmd == "/clear":
@@ -554,7 +652,8 @@ async def handle_saved_messages(event):
             f"├ Ссылок в очереди: {link_queue.qsize()}\n"
             f"├ Активных пачек: {len(batches)}\n"
             f"├ Одновременных скачиваний: {CONCURRENT_DOWNLOADS}\n"
-            f"├ Upload: по одному файлу (Lock)\n"
+            f"├ Отправка: по одному файлу (Lock)\n"
+            f"├ Пауза (/stop): {'да' if cancel_flag['cancel'] else 'нет'}\n"
             f"└ Обработано уникальных: {len(processed)}"
         )
         return
@@ -574,14 +673,13 @@ async def handle_saved_messages(event):
         "finished": False,
         "to_delete": [event],
     }
-    cancel_flag["cancel"] = False
 
     for chat_id, msg_id, full_link in links:
         await link_queue.put((chat_id, msg_id, full_link, batch_id))
 
     info_msg = await event.respond(
         f"📥 Добавлено ссылок: {len(links)}. "
-        f"Скачивание: до {CONCURRENT_DOWNLOADS} параллельно, upload: по одному. "
+        f"Скачивание: до {CONCURRENT_DOWNLOADS} параллельно, отправка: по одному. "
         f"Всего в очереди: {link_queue.qsize()}"
     )
     batches[batch_id]["to_delete"].append(info_msg)
@@ -615,14 +713,18 @@ async def main():
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
     ]
-    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS} (upload — по одному)")
+    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS} (отправка в избранное — по одному)")
 
     print(
         f"\n🚀 Готово!\n"
         f"├ Скачивание: до {CONCURRENT_DOWNLOADS} параллельно\n"
         f"├ Отправка: видео/аудио/документ (метаданные через hachoir)\n"
         f"├ Итог пачки удаляется через {CLEANUP_DELAY} сек\n"
-        f"└ Команды: /stop, /clear, /stats"
+        f"└ Команды:\n"
+        f"   /stop   — приостановить обработку новых ссылок (текущие докачиваются)\n"
+        f"   /resume — возобновить обработку после /stop\n"
+        f"   /clear  — очистить очередь ссылок\n"
+        f"   /stats  — статистика (включая статус паузы)"
     )
     try:
         await client.run_until_disconnected()
