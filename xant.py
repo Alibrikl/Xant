@@ -1229,63 +1229,88 @@ async def offer_send_downloaded():
 
     answer = input(
         "\nОтправить эти файлы в Избранное?\n"
-        "  y — отправить (файлы будут удалены с диска после отправки)\n"
-        "  n — удалить с диска и скачать заново\n"
-        "  s — пропустить (оставить как есть, попросим позже)\n"
+        "  y — отправить\n"
+        "  n — удалить\n"
+        "  s — отложить до следующего запуска\n"
         "Выбор [y/n/s]: "
     ).strip().lower()
 
     if answer in ("s", ""):
         _log(
-            f"  ⏭  пользователь пропустил — "
-            f"to_send всё равно ставлю в очередь, иначе пачка зависнет"
+            f"  ⏭  пользователь отложил отправку — "
+            f"файлы остаются downloaded в JSON, пачки закрываются "
+            f"без отправки, при следующем запуске спросим снова"
         )
-        # Ставим to_send в очередь, чтобы пачка не висела вечно.
-        # Файлы останутся на диске и будут отправлены в штатном порядке.
-        for qid, it in items:
-            if qid not in batches:
-                batches[qid] = {
-                    "event": _make_fake_event(),
-                    "links": [(it["chat_id"], it["msg_id"], it["link"])],
-                    "status_msgs": {},
-                    "link_states": {},
-                    "lock": asyncio.Lock(),
-                    "reorder_lock": asyncio.Lock(),
-                    "reorder_state": {"running": False, "pending": False, "last": 0.0},
-                    "total": 0, "ok": 0, "skip": 0, "fail": 0,
-                    "finished": False,
-                    "to_delete": [],
-                }
-            b = batches[qid]
-            key = (it["chat_id"], it["msg_id"])
-            b["link_states"].setdefault(key, {
-                "status": "downloaded", "percent": 0.0, "current": 0,
-                "total": 0, "last_cb": 0.0, "last_edit": 0.0,
-                "up_current": 0, "up_total": 0, "up_percent": 0.0, "last_up_cb": 0.0,
-            })
-            b["total"] = max(b["total"], len(b["link_states"]))
-            await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
+        # Файлы остаются на диске и в статусе downloaded в JSON.
+        # Пачки, которые сейчас в памяти, закрываем — чтобы не висели.
+        # При следующем запуске resume_pending_queues / offer_send_downloaded
+        # снова их найдут и предложат отправить.
+        for qid in {qid for qid, _ in items}:
+            b = batches.get(qid)
+            if b is None:
+                continue
+            b["finished"] = True
+            # Гасим статус-сообщения, чтобы не оставались висеть в чате
+            for m in list(b["status_msgs"].values()):
+                _schedule_delete(m)
+            b["status_msgs"].clear()
+            batches.pop(qid, None)
+            # JSON НЕ удаляем — при следующем запуске снова найдём
+            _log(
+                f"    ⏸  #{qid}: пачка закрыта без отправки, "
+                f"JSON сохранён для следующего запуска"
+            )
         return
 
     if answer in ("n", "no", "нет", "н"):
         for qid, it in items:
+            # 1. Удаляем локальный файл
             path = os.path.join(DOWNLOAD_DIR, it["local_file"])
             try:
                 os.remove(path)
+                _log(f"    🗑  #{qid} {it['link']}: удалён файл {it['local_file']}")
             except Exception as e:
-                print(f"  ⚠️  не удалось удалить {it['local_file']}: {e}")
+                _log(
+                    f"    ⚠️  #{qid} {it['link']}: "
+                    f"не удалось удалить файл {it['local_file']}: {e}"
+                )
+
+            # 2. Помечаем элемент как skip в JSON (больше не качаем)
             _mark_item(
                 qid, it["chat_id"], it["msg_id"],
-                status="pending",
+                status="skip",
                 local_file=None,
                 downloaded_at=None,
             )
+
+            # 3. Удаляем статус-сообщение из чата и учитываем в счётчиках
             if qid in batches:
-                st = batches[qid]["link_states"].get((it["chat_id"], it["msg_id"]))
+                b = batches[qid]
+                key = (it["chat_id"], it["msg_id"])
+                st = b["link_states"].get(key)
                 if st is not None:
-                    st["status"] = "pending"
-            await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
-        print(f"  🗑  Удалено {total} файл(ов), будут скачаны заново.")
+                    st["status"] = "skip"
+                    st["last_edit"] = 0.0
+                    st["last_cb"] = 0.0
+                old_msg = b["status_msgs"].pop(key, None)
+                if old_msg is not None:
+                    try:
+                        await old_msg.delete()
+                        _log(
+                            f"    🗑  #{qid} {it['link']}: "
+                            f"удалён статус id={old_msg.id} (n → отмена)"
+                        )
+                    except Exception as e:
+                        _log(
+                            f"    ⚠️  #{qid} {it['link']}: "
+                            f"не удалось удалить статус id={old_msg.id}: {e}"
+                        )
+                _mark_item(qid, it["chat_id"], it["msg_id"], status_msg_id=None)
+
+                # Учитываем как skip, чтобы пачка закрылась
+                b["skip"] = b.get("skip", 0) + 1
+                asyncio.create_task(_maybe_finish_batch(qid))
+        print(f"  🗑  Удалено {total} файл(ов) и их статусов.")
         return
 
     for qid, it in items:
