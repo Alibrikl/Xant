@@ -519,10 +519,19 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             status = it["status"]
 
             if status == "done" and it.get("file_message_id"):
+                # Если старый слот не удалён — НЕ пересылаем, иначе будет дубликат.
+                # Оставляем старый slot_msg_id, следующая перетусовка попробует снова.
+                if it.get("slot_msg_id"):
+                    print(
+                        f"[reconcile] Пропуск пересылки {full_link}: "
+                        f"старый слот {it['slot_msg_id']} не удалён"
+                    )
+                    continue
                 try:
                     fwd = await client.forward_messages(
                         "me", it["file_message_id"], from_peer="me",
                     )
+
                     slot_id = fwd[0].id if isinstance(fwd, list) else fwd.id
                 except FloodWaitError as fwe:
                     print(f"\n[FloodWait] Пауза {fwe.seconds} сек. при пересылке...")
