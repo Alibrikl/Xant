@@ -475,29 +475,43 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             return
 
     async with batch["reorder_lock"]:
+        # 1. Собираем id всех текущих слотов (без дублей)
         to_delete_ids: list[int] = []
         for it in q["items"]:
             for k in ("status_msg_id", "slot_msg_id"):
                 mid = it.get(k)
                 if mid:
                     to_delete_ids.append(mid)
-                    it[k] = None
+        to_delete_ids = list(dict.fromkeys(to_delete_ids))
+
+        # 2. Удаляем пачками, запоминаем успешно удалённые
+        deleted_ok: set[int] = set()
         if to_delete_ids:
             for i in range(0, len(to_delete_ids), 100):
                 chunk = to_delete_ids[i:i + 100]
                 try:
                     await client.delete_messages("me", chunk)
+                    deleted_ok.update(chunk)
                 except FloodWaitError as fwe:
                     print(f"\n[FloodWait] Пауза {fwe.seconds} сек. при удалении слотов...")
                     await asyncio.sleep(fwe.seconds)
                     try:
                         await client.delete_messages("me", chunk)
+                        deleted_ok.update(chunk)
                     except Exception as e:
                         print(f"[reconcile] Повторное удаление не удалось: {e}")
                 except Exception as e:
                     print(f"[reconcile] Ошибка удаления слотов пачки {batch_id}: {e}")
+
+        # 3. Обнуляем id только у успешно удалённых
+        for it in q["items"]:
+            for k in ("status_msg_id", "slot_msg_id"):
+                mid = it.get(k)
+                if mid and mid in deleted_ok:
+                    it[k] = None
         _save_queue(batch_id)
 
+        # 4. Публикуем заново по порядку
         new_status_msgs: dict[tuple, any] = {}
         for it in q["items"]:
             key = (it["chat_id"], it["msg_id"])
@@ -528,6 +542,7 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     slot_id = msg.id
                 it["slot_msg_id"] = slot_id
                 it["status_msg_id"] = None
+                _save_queue(batch_id)   # ← сохраняем сразу
             else:
                 if status == "fail":
                     text = f"❌ {full_link}"
@@ -553,9 +568,9 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     new_status_msgs[key] = msg
                 else:
                     it["status_msg_id"] = None
+                _save_queue(batch_id)   # ← сохраняем сразу
 
-            _save_queue(batch_id)
-
+        # 5. Обновляем in-memory
         batch["status_msgs"] = new_status_msgs
         for it in q["items"]:
             key = (it["chat_id"], it["msg_id"])
@@ -573,6 +588,8 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             else:
                 st["last_edit"] = 0.0
                 st["last_cb"] = 0.0
+
+
 
 
 async def request_reconcile(batch_id: int, force: bool = False):
