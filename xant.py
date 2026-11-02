@@ -19,8 +19,10 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
 )
 
-ENV_FILE = ".env"
-DOWNLOAD_DIR = "downloads"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 QUEUE_DIR = os.path.join(DOWNLOAD_DIR, "queues")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(QUEUE_DIR, exist_ok=True)
@@ -32,7 +34,7 @@ CONCURRENT_DOWNLOADS = 3
 CLEANUP_DELAY = 10
 
 REORDER_AFTER_EACH_FILE = True
-REORDER_DEBOUNCE = 0.7
+REORDER_DEBOUNCE = 3.0
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"}
@@ -59,7 +61,7 @@ except (TypeError, ValueError):
     exit(1)
 
 client = TelegramClient(
-    "user_session", API_ID, API_HASH,
+    os.path.join(BASE_DIR, "user_session"), API_ID, API_HASH,
     connection_retries=10, retry_delay=3, timeout=60,
 )
 
@@ -80,6 +82,8 @@ queues: dict[int, dict] = {}
 
 shutdown_event = asyncio.Event()
 
+_pending_deletions: set[asyncio.Task] = set()
+
 # ---------- Отложенное удаление ----------
 async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
     if delay > 0:
@@ -96,6 +100,13 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
                 await asyncio.sleep(fwe.seconds)
             except Exception:
                 break
+
+
+def _schedule_delete(*messages, delay: float = CLEANUP_DELAY):
+    task = asyncio.create_task(_delete_later(*messages, delay=delay))
+    _pending_deletions.add(task)
+    task.add_done_callback(_pending_deletions.discard)
+    return task
 
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -127,6 +138,14 @@ def _detect_extension(message) -> str:
     if isinstance(message.media, types.MessageMediaDocument):
         doc = message.media.document
         if isinstance(doc, types.Document):
+            # 1. Явное имя файла — самый надёжный источник расширения
+            for attr in doc.attributes:
+                if isinstance(attr, types.DocumentAttributeFilename):
+                    _, ext = os.path.splitext(attr.file_name or "")
+                    if ext:
+                        return ext.lower()
+
+            # 2. Фолбэк по типу вложения
             for attr in doc.attributes:
                 if isinstance(attr, types.DocumentAttributeVideo):
                     return ".mp4"
@@ -136,10 +155,6 @@ def _detect_extension(message) -> str:
                     return ".webp"
                 if isinstance(attr, types.DocumentAttributeAnimated):
                     return ".mp4"
-                if isinstance(attr, types.DocumentAttributeFilename):
-                    _, ext = os.path.splitext(attr.file_name or "")
-                    if ext:
-                        return ext.lower()
     return ".bin"
 
 
@@ -275,6 +290,7 @@ def _list_queue_files() -> list[int]:
             ids.append(int(m.group(1)))
     return sorted(ids)
 
+
 # ---------- Скачивание ----------
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
@@ -316,6 +332,10 @@ async def download_with_retry(
             await asyncio.sleep(fwe.seconds)
         except Exception as e:
             attempt += 1
+            print(
+                f"[download_with_retry] {type(e).__name__} "
+                f"(попытка {attempt}/{max_retries}): {e}"
+            )
             if attempt >= max_retries:
                 raise e
             await asyncio.sleep(2 * attempt)
@@ -423,7 +443,7 @@ def _render_status(st: dict, full_link: str) -> str:
     if st["status"] == "skip":
         return f"⚠️ {full_link} (пропущено)"
     if st["status"] == "downloaded":
-        return f"🕒 скачано, отправляю... {full_link}"
+        return f"⏳ ожидание... {full_link}"
     if st["status"] == "uploading":
         cur = st.get("up_current", 0)
         tot = st.get("up_total", 0)
@@ -441,7 +461,7 @@ def _render_status(st: dict, full_link: str) -> str:
             f"({human_size(cur)} / {human_size(tot)}) "
             f"{full_link}"
         )
-    return f"⏳ ожидание... {full_link}"
+    return f"📋 {full_link}"
 
 
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
@@ -519,8 +539,6 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             status = it["status"]
 
             if status == "done" and it.get("file_message_id"):
-                # Если старый слот не удалён — НЕ пересылаем, иначе будет дубликат.
-                # Оставляем старый slot_msg_id, следующая перетусовка попробует снова.
                 if it.get("slot_msg_id"):
                     print(
                         f"[reconcile] Пропуск пересылки {full_link}: "
@@ -531,7 +549,6 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     fwd = await client.forward_messages(
                         "me", it["file_message_id"], from_peer="me",
                     )
-
                     slot_id = fwd[0].id if isinstance(fwd, list) else fwd.id
                 except FloodWaitError as fwe:
                     print(f"\n[FloodWait] Пауза {fwe.seconds} сек. при пересылке...")
@@ -551,7 +568,7 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     slot_id = msg.id
                 it["slot_msg_id"] = slot_id
                 it["status_msg_id"] = None
-                _save_queue(batch_id)   # ← сохраняем сразу
+                _save_queue(batch_id)
             else:
                 if status == "fail":
                     text = f"❌ {full_link}"
@@ -560,11 +577,11 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                 elif status == "done":
                     text = f"✅ {full_link}"
                 elif status == "downloaded":
-                    text = f"🕒 {full_link} (скачано, отправляю...)"
+                    text = f"⏳ {full_link} (ожидание...)"
                 elif status == "uploading":
                     text = f"📤 {full_link} (отправляю...)"
                 else:
-                    text = f"⏳ ожидание... {full_link}"
+                    text = f"📋 {full_link}"
                 try:
                     msg = await client.send_message("me", text)
                 except FloodWaitError as fwe:
@@ -577,7 +594,7 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     new_status_msgs[key] = msg
                 else:
                     it["status_msg_id"] = None
-                _save_queue(batch_id)   # ← сохраняем сразу
+                _save_queue(batch_id)
 
         # 5. Обновляем in-memory
         batch["status_msgs"] = new_status_msgs
@@ -597,10 +614,6 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             else:
                 st["last_edit"] = 0.0
                 st["last_cb"] = 0.0
-
-
-
-
 async def request_reconcile(batch_id: int, force: bool = False):
     batch = batches.get(batch_id)
     if batch is None:
@@ -632,6 +645,7 @@ async def request_reconcile(batch_id: int, force: bool = False):
 
         if not state["pending"]:
             break
+
 
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
@@ -769,7 +783,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         return "ok"
 
     except Exception as e:
-        print(f"[process_link] Ошибка {full_link}: {e}")
+        print(f"[process_link] Ошибка {full_link}: {type(e).__name__}: {e}")
         if filename and os.path.exists(filename):
             local_name = os.path.basename(filename)
             _mark_item(
@@ -802,6 +816,7 @@ async def link_worker(worker_id: int):
             if cancel_flag["cancel"]:
                 result = "skip"
                 _mark_item(batch_id, chat_id, msg_id, status="skip")
+                processed.add((chat_id, msg_id))
                 batch = batches.get(batch_id)
                 if batch is not None:
                     st = batch["link_states"].get((chat_id, msg_id))
@@ -829,7 +844,6 @@ async def link_worker(worker_id: int):
         finally:
             in_progress["count"] -= 1
 
-
 async def _maybe_finish_batch(batch_id: int):
     b = batches.get(batch_id)
     if b is None:
@@ -855,7 +869,7 @@ async def _maybe_finish_batch(batch_id: int):
         )
         b["to_delete"].append(summary_msg)
 
-    asyncio.create_task(_delete_later(*b["to_delete"]))
+    _schedule_delete(*b["to_delete"])
     batches.pop(batch_id, None)
 
     try:
@@ -863,6 +877,7 @@ async def _maybe_finish_batch(batch_id: int):
         os.remove(_queue_path(batch_id))
     except Exception:
         pass
+
 
 # ---------- Возобновление после перезапуска ----------
 async def cleanup_orphan_files():
@@ -878,6 +893,7 @@ async def cleanup_orphan_files():
             if it.get("status") in ("downloaded", "uploading") and it.get("local_file"):
                 protected.add(it["local_file"])
 
+    now = time.time()
     orphans = []
     for name in os.listdir(DOWNLOAD_DIR):
         full = os.path.join(DOWNLOAD_DIR, name)
@@ -885,6 +901,11 @@ async def cleanup_orphan_files():
             continue
         if name in protected:
             continue
+        try:
+            if now - os.path.getmtime(full) < 600:
+                continue
+        except Exception:
+            pass
         orphans.append(full)
 
     if not orphans:
@@ -968,10 +989,20 @@ async def resume_pending_queues():
             ):
                 try:
                     m = await client.get_messages("me", ids=it["status_msg_id"])
-                    if m:
-                        status_msgs[key] = m
                 except Exception:
-                    pass
+                    m = None
+                if not m:
+                    # сообщение-статус потеряно — пересоздаём
+                    try:
+                        m = await client.send_message(
+                            "me", f"📋 {it['link']}"
+                        )
+                        _mark_item(qid, it["chat_id"], it["msg_id"],
+                                   status_msg_id=m.id)
+                    except Exception:
+                        m = None
+                if m:
+                    status_msgs[key] = m
 
         batches[qid] = {
             "event": _make_fake_event(),
@@ -991,9 +1022,11 @@ async def resume_pending_queues():
         for it in pending:
             await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
 
+        for it in to_send:
+            await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
+
         if not pending and not to_send:
             await _maybe_finish_batch(qid)
-
 
 def _find_downloaded_items() -> list[tuple[int, dict]]:
     result = []
@@ -1098,6 +1131,7 @@ async def offer_send_downloaded():
         await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
     print(f"  📤 Поставлено в очередь на отправку: {total}")
 
+
 # ---------- Отправка старых файлов из downloads/ ----------
 async def upload_existing_downloads():
     files = [
@@ -1159,8 +1193,7 @@ async def upload_existing_downloads():
         )
     except Exception:
         pass
-    asyncio.create_task(_delete_later(status))
-
+    _schedule_delete(status)
 
 # ---------- Обработчик сообщений ----------
 @client.on(events.NewMessage(chats="me"))
@@ -1189,6 +1222,7 @@ async def handle_saved_messages(event):
         return
 
     if cmd == "/clear":
+        cancel_flag["cancel"] = False
         cleared = 0
         while not link_queue.empty():
             try:
@@ -1203,7 +1237,7 @@ async def handle_saved_messages(event):
                 continue
             b["finished"] = True
             for m in list(b["status_msgs"].values()):
-                asyncio.create_task(_delete_later(m))
+                _schedule_delete(m)
             b["status_msgs"].clear()
             batches.pop(batch_id, None)
             queues.pop(batch_id, None)
@@ -1244,7 +1278,7 @@ async def handle_saved_messages(event):
     items = []
 
     for chat_id, msg_id, full_link in links:
-        status_msg = await event.respond(f"⏳ ожидание... {full_link}")
+        status_msg = await event.respond(f"📋 {full_link}")
         key = (chat_id, msg_id)
         status_msgs[key] = status_msg
         link_states[key] = {
@@ -1306,7 +1340,7 @@ async def main():
         answer = input("\nОтправить их в Избранное? [y/n]: ").strip().lower()
         send_old = answer in ("y", "yes", "да", "д")
 
-    session_file = "user_session.session"
+    session_file = os.path.join(BASE_DIR, "user_session.session")
     had_session_file = os.path.exists(session_file)
 
     print("⏳ Подключение к Telegram...")
@@ -1328,18 +1362,18 @@ async def main():
     )
     print(f"  📦 Лимит на отправку: {human_size(limit)}")
 
+    workers = [
+        asyncio.create_task(link_worker(i + 1))
+        for i in range(CONCURRENT_DOWNLOADS)
+    ]
+    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
+
     await cleanup_orphan_files()
     await resume_pending_queues()
     await offer_send_downloaded()
 
     if send_old:
         await upload_existing_downloads()
-
-    workers = [
-        asyncio.create_task(link_worker(i + 1))
-        for i in range(CONCURRENT_DOWNLOADS)
-    ]
-    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
 
     print(
         f"\n🚀 Готово!\n"
@@ -1357,7 +1391,6 @@ async def main():
             [disconnect_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # отменяем оставшуюся задачу, чтобы не висела
         for t in (disconnect_task, shutdown_task):
             if not t.done():
                 t.cancel()
@@ -1367,6 +1400,10 @@ async def main():
         for w in workers:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+
+        if _pending_deletions:
+            await asyncio.gather(*_pending_deletions, return_exceptions=True)
+
         await asyncio.sleep(0.5)
         try:
             await client.disconnect()
@@ -1381,7 +1418,7 @@ if __name__ == "__main__":
     )
     logging.getLogger("telethon").setLevel(logging.WARNING)
     try:
-        client.loop.run_until_complete(main())
+        client.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Остановлено пользователем (Ctrl+C).")
     except Exception as crash_error:
