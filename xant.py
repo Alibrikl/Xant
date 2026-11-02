@@ -1018,7 +1018,6 @@ async def cleanup_orphan_files():
             if it.get("status") in ("downloaded", "uploading") and it.get("local_file"):
                 protected.add(it["local_file"])
 
-    now = time.time()
     orphans = []
     for name in os.listdir(DOWNLOAD_DIR):
         full = os.path.join(DOWNLOAD_DIR, name)
@@ -1026,11 +1025,6 @@ async def cleanup_orphan_files():
             continue
         if name in protected:
             continue
-        try:
-            if now - os.path.getmtime(full) < 10080:
-                continue
-        except Exception:
-            pass
         orphans.append(full)
 
     if not orphans:
