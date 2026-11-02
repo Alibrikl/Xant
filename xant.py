@@ -1027,7 +1027,7 @@ async def cleanup_orphan_files():
         if name in protected:
             continue
         try:
-            if now - os.path.getmtime(full) < 600:
+            if now - os.path.getmtime(full) < 10080:
                 continue
         except Exception:
             pass
