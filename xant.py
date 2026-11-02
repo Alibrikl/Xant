@@ -323,8 +323,17 @@ async def _find_in_me(display_name: str, file_size: int | None,
     # 1) Проверяем кэш — только успешные находки
     cached = _find_cache.get(cache_key)
     if cached is not None:
-        _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
-        return cached
+        try:
+            m = await client.get_messages("me", ids=cached)
+            if m is None:
+                _find_cache.pop(cache_key, None)
+                # проваливаемся в поиск ниже
+            else:
+                _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
+                return cached
+        except Exception:
+            # не смогли проверить — доверяем кэшу
+            return cached
 
     check_size = bool(file_size and file_size > 0)
     attempt = 0
@@ -421,6 +430,10 @@ def _scan_downloads() -> dict:
       - manual:      файла нет в JSON-очередях (пользователь положил руками)
       - own_partial: есть в JSON, статус pending/downloading (недокачан)
       - own_ready:   есть в JSON, статус downloaded/uploading (готов к отправке)
+
+    Файлы со статусами done/fail/skip в JSON — аномалия (файл должен был
+    быть удалён или не создаваться). Считаем их manual, чтобы спросить
+    пользователя при старте, а не терять.
     """
     own_by_name: dict[str, tuple[int, dict]] = {}
     for qid in _list_queue_files():
@@ -443,19 +456,65 @@ def _scan_downloads() -> dict:
         full = os.path.join(DOWNLOAD_DIR, name)
         if not os.path.isfile(full):
             continue
+
         entry = own_by_name.get(name)
         if entry is None:
+            # Файла нет в JSON — ручной
             manual.append(full)
+            continue
+
+        qid, it = entry
+        status = it.get("status")
+
+        if status in ("pending", "downloading"):
+            # Недокачан — перекачать
+            own_partial.append((qid, it, full))
+        elif status in ("downloaded", "uploading"):
+            # Готов к отправке — поставить в очередь
+            own_ready.append((qid, it, full))
         else:
-            qid, it = entry
-            if it.get("status") in ("pending", "downloading"):
-                own_partial.append((qid, it, full))
-            else:  # downloaded / uploading
-                own_ready.append((qid, it, full))
+            # done / fail / skip с файлом на диске — аномалия.
+            # Файл должен был быть удалён (done) или не создаваться (fail/skip).
+            # Считаем manual, чтобы не потерять: спросим пользователя при старте.
+            print(
+                f"  ⚠️  файл {name}: статус «{status}» в JSON, "
+                f"но файл на диске — считаю manual"
+            )
+            manual.append(full)
 
     return {"manual": manual, "own_partial": own_partial, "own_ready": own_ready}
 
 # ---------- Скачивание ----------
+
+def _cleanup_partial(local_path: str, expected_size: int = 0):
+    """
+    Удаляет частично скачанный файл и его .part-версию.
+    Если expected_size > 0 и файл уже полного размера — НЕ трогает
+    (значит, скачивание фактически завершилось, просто упало на
+    пост-обработке).
+    Возвращает True, если что-то удалили.
+    """
+    if not local_path:
+        return False
+
+    removed = False
+    for path in (local_path, local_path + ".part"):
+        if not os.path.exists(path):
+            continue
+        try:
+            if expected_size > 0:
+                actual = os.path.getsize(path)
+                if actual >= expected_size:
+                    # файл полного размера — не наш случай, не трогаем
+                    continue
+            os.remove(path)
+            removed = True
+            _log(f"[cleanup] удалён частичный файл: {os.path.basename(path)}")
+        except Exception as e:
+            _log(f"[cleanup] не удалось удалить {path}: {e}")
+    return removed
+
+
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
     size_holder: dict | None = None, max_retries: int = 3,
@@ -468,18 +527,10 @@ async def download_with_retry(
     if size_holder is not None:
         size_holder["size"] = target_msg.file.size if target_msg.file else 0
 
-        # ✅ Проверка свободного места ДО начала скачивания:
-        # иначе download_media упадёт посередине, оставит частичный файл
-        # в downloads/, и download_with_retry попробует ещё 2 раза —
-        # каждый раз заново, накапливая мусор.
-        #
-        # Возвращаем None (а не raise), чтобы process_link обработал это
-        # как обычный "не удалось скачать" → fail → корректная пометка
-        # в JSON и статус-сообщении.
         if size_holder["size"] > 0:
             try:
                 free = shutil.disk_usage(DOWNLOAD_DIR).free
-                need = size_holder["size"] * 1.1  # +10% запас
+                need = size_holder["size"] * 1.1
                 if free < need:
                     print(
                         f"\n[disk check] недостаточно места для "
@@ -488,8 +539,6 @@ async def download_with_retry(
                     )
                     return None
             except Exception as e:
-                # Не смогли проверить — не блокируем скачивание,
-                # пусть попробует (лучше попытаться, чем упасть на проверке)
                 print(f"[disk check] не удалось проверить место: {e}")
 
     suggested_filename = build_filename(target_msg)
@@ -505,37 +554,77 @@ async def download_with_retry(
             return await client.download_media(
                 target_msg, file=local_path, progress_callback=progress_callback,
             )
+
         except FileReferenceExpiredError:
             attempt += 1
             print(f"\n[Внимание] Ссылка устарела (попытка {attempt}). Перезапрашиваем...")
-            if os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
+            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
             if attempt >= max_retries:
                 raise
             target_msg = await client.get_messages(chat_id, ids=msg_id, use_cache=False)
             if not target_msg or not target_msg.media:
                 return None
+            # ✅ обновляем размер — файл в канале мог измениться
+            if size_holder is not None:
+                size_holder["size"] = target_msg.file.size if target_msg.file else 0
+
+            # ✅ запоминаем старый путь, чтобы после unique_path()
+            # обнаружить смену имени (файл заменили в канале)
+            old_path = local_path
+
             suggested_filename = build_filename(target_msg)
             local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
+
+            # ✅ Если путь сменился, а старый файл остался (был полным
+            # при первой попытке — _cleanup_partial его не тронул),
+            # удаляем его: в JSON уже записан новый local_file,
+            # старый файл стал бы сиротой.
+            if old_path != local_path and os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                    _log(
+                        f"  🧹 FileReferenceExpired: путь сменился "
+                        f"({os.path.basename(old_path)} → "
+                        f"{os.path.basename(local_path)}) — "
+                        f"старый файл удалён"
+                    )
+                except Exception as e:
+                    _log(
+                        f"  ⚠️  FileReferenceExpired: путь сменился, "
+                        f"но старый файл не удалён ({old_path}): {e}"
+                    )
+            elif old_path != local_path:
+                _log(
+                    f"  ℹ️  FileReferenceExpired: путь сменился "
+                    f"({os.path.basename(old_path)} → "
+                    f"{os.path.basename(local_path)}), "
+                    f"старого файла на диске нет"
+                )
+
             if size_holder is not None:
                 size_holder["path"] = local_path
             if on_path_known is not None:
                 on_path_known(local_path)
+
         except FloodWaitError as fwe:
+            # ✅ чистим частичный файл ПЕРЕД ожиданием:
+            # иначе после паузы download_media может дописать в него
+            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
             print(f"\n[FloodWait] Ждём {fwe.seconds} сек...")
             await asyncio.sleep(fwe.seconds)
+
         except Exception as e:
             attempt += 1
             print(
                 f"[download_with_retry] {type(e).__name__} "
                 f"(попытка {attempt}/{max_retries}): {e}"
             )
+            # ✅ чистим частичный файл ПЕРЕД следующей попыткой
+            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
             if attempt >= max_retries:
                 raise e
             await asyncio.sleep(2 * attempt)
+
 # ---------- Метаданные ----------
 def _to_seconds(value) -> int:
     if value is None:
@@ -656,6 +745,18 @@ def _render_status(st: dict, full_link: str) -> str:
         )
     return f"📋 {full_link}"
 
+def _initial_status_text(it: dict) -> str:
+    """Начальный текст статус-сообщения для восстановленного элемента."""
+    link = it.get("link", "")
+    status = it.get("status", "pending")
+    if status == "downloading":
+        return f"⬇️ 0.0% {link}"
+    if status == "downloaded":
+        return f"⏳ ожидание... {link}"
+    if status == "uploading":
+        return f"📤 0.0% {link}"
+    # pending и всё остальное
+    return f"📋 {link}"
 
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
     st = batch["link_states"].get(key)
@@ -903,7 +1004,6 @@ async def request_reconcile(batch_id: int, force: bool = False):
         if not state["pending"]:
             break
 
-
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
     batch = batches.get(batch_id)
@@ -1025,7 +1125,11 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     )
 
             st["status"] = "downloaded"
-            _mark_item(batch_id, chat_id, msg_id, status="downloaded")
+            _mark_item(
+                batch_id, chat_id, msg_id,
+                status="downloaded",
+                file_size=os.path.getsize(filename),
+            )
             await _update_status_msg(batch, key, full_link, force=True)
         else:
             def _on_path(path):
@@ -1075,6 +1179,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 status="downloaded",
                 local_file=local_name,
                 downloaded_at=time.time(),
+                file_size=size_holder["size"],
             )
             st["status"] = "downloaded"
             _log(f"⬇️  скачан {full_link} → {local_name}")
@@ -1148,17 +1253,59 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
 
     except Exception as e:
         _log(f"❌ {full_link}: {type(e).__name__}: {e}")
-        if filename and os.path.exists(filename):
-            local_name = os.path.basename(filename)
-            _mark_item(
-                batch_id, chat_id, msg_id,
-                status="downloaded",
-                local_file=local_name,
-                downloaded_at=time.time(),
-            )
+
+        # ✅ filename может быть None, если download_with_retry бросил
+        # исключение на последней попытке. Но size_holder["path"]
+        # устанавливается ДО цикла попыток и всегда актуален.
+        fallback_path = size_holder.get("path")
+        expected = size_holder.get("size", 0)
+
+        if fallback_path and os.path.exists(fallback_path):
+            try:
+                actual = os.path.getsize(fallback_path)
+            except Exception:
+                actual = 0
+
+            if expected > 0 and actual >= expected:
+                # файл целый — не теряем, помечаем downloaded,
+                # чтобы watchdog / рестарт переотправил
+                local_name = os.path.basename(fallback_path)
+                _mark_item(
+                    batch_id, chat_id, msg_id,
+                    status="downloaded",
+                    local_file=local_name,
+                    downloaded_at=time.time(),
+                    file_size=expected,
+                )
+                st["status"] = "downloaded"
+                _log(
+                    f"♻️  {full_link}: файл целый "
+                    f"({human_size(actual)}) — помечен downloaded "
+                    f"для повторной отправки"
+                )
+                await _update_status_msg(batch, key, full_link, force=True)
+                processed.discard(key)
+                if REORDER_AFTER_EACH_FILE:
+                    await request_reconcile(batch_id, force=False)
+                # ✅ "deferred" — НЕ инкрементим fail, batch остаётся
+                # открытым, watchdog/рестарт подхватит downloaded
+                return "deferred"
+            else:
+                # частичный файл — чистим и помечаем fail
+                _cleanup_partial(fallback_path, expected)
+                _mark_item(batch_id, chat_id, msg_id,
+                           status="fail", local_file=None)
+                st["status"] = "fail"
+                _log(
+                    f"🗑  {full_link}: частичный файл "
+                    f"({human_size(actual)} из {human_size(expected)}) "
+                    f"удалён — fail"
+                )
         else:
+            # файла на диске нет — обычный fail
             _mark_item(batch_id, chat_id, msg_id, status="fail")
-        st["status"] = "fail"
+            st["status"] = "fail"
+
         await _update_status_msg(batch, key, full_link, force=True)
         processed.discard(key)
         if REORDER_AFTER_EACH_FILE:
@@ -1365,7 +1512,10 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             continue
                         _log(f"  🐕 #{batch_id} {it['link']}: uploading без файла — проверяю me")
                         try:
-                            found_id = await _find_in_me(display_name=local, file_size=None)
+                            found_id = await _find_in_me(
+                                display_name=local,
+                                file_size=it.get("file_size"),
+                            )
                         except FloodWaitError:
                             _log(f"  🐕 #{batch_id} {it['link']}: FloodWait — откладываю")
                             continue
@@ -1457,7 +1607,9 @@ async def resume_pending_queues():
         # ✅ Устанавливаем очередь ДО любых _mark_item
         queues[qid] = q
 
-        # ✅ uploading: проверяем me, чтобы не отправить дубликат
+        # ============================================================
+        # ЭТАП 1. Обработка uploading-элементов
+        # ============================================================
         uploading_done = 0
         uploading_downloaded = 0
         uploading_fail = 0
@@ -1527,7 +1679,7 @@ async def resume_pending_queues():
                 )
                 try:
                     found_id = await _find_in_me(
-                        display_name=local, file_size=None,
+                        display_name=local, file_size=it.get("file_size"),
                     )
                 except FloodWaitError:
                     uploading_fail += 1
@@ -1558,29 +1710,196 @@ async def resume_pending_queues():
                 f"  📊 #{qid}: uploading → done={uploading_done}, "
                 f"→ downloaded={uploading_downloaded}, → fail={uploading_fail}"
             )
-        _save_queue(qid)
 
-        # ✅ НОВЫЙ БЛОК: закрываем очередь, если после обработки
-        # uploading все элементы оказались в терминальных статусах.
-        # Без этого JSON с одними fail/done/skip будет висеть на диске
-        # вечно: batches[qid] ещё не создан, а _maybe_finish_batch
-        # вызывается только из воркеров/watchdog, которые подхватят
-        # только downloaded/uploading.
+        # ============================================================
+        # ЭТАП 2. Обработка pending-элементов (перекачка)
+        # ============================================================
+        # pending = элемент был в очереди, но не начал качаться
+        # (например, own_partial сброшен в pending в main()).
+        # Нужно поставить его в link_queue, предварительно создав
+        # batch в памяти с link_states и статус-сообщениями.
+        pending_items = [
+            it for it in items
+            if it.get("status") == "pending"
+        ]
+
+        if pending_items:
+            _log(
+                f"  🔄 #{qid}: найдено pending-элементов для перекачки: "
+                f"{len(pending_items)}"
+            )
+
+            # Проверяем, есть ли уже batch (не должно быть при старте,
+            # но на всякий случай — вдруг resume вызван повторно)
+            b = batches.get(qid)
+            if b is None:
+                # Создаём batch для восстановления
+                status_msgs: dict[tuple, any] = {}
+                link_states: dict[tuple, dict] = {}
+
+                for it in items:
+                    key = (it["chat_id"], it["msg_id"])
+
+                    # link_states для ВСЕХ элементов (не только pending),
+                    # чтобы reconcile и _update_status_msg работали корректно
+                    st = {
+                        "status": it.get("status", "pending"),
+                        "percent": 0.0,
+                        "current": 0,
+                        "total": 0,
+                        "last_cb": 0.0,
+                        "last_edit": 0.0,
+                        "up_current": 0,
+                        "up_total": 0,
+                        "up_percent": 0.0,
+                        "last_up_cb": 0.0,
+                    }
+                    link_states[key] = st
+
+                    # Статус-сообщение: пробуем переиспользовать
+                    # status_msg_id / slot_msg_id из JSON
+                    existing_msg = None
+                    for field in ("status_msg_id", "slot_msg_id"):
+                        mid = it.get(field)
+                        if not mid:
+                            continue
+                        try:
+                            m = await client.get_messages("me", ids=mid)
+                            if m:
+                                existing_msg = m
+                                break
+                        except FloodWaitError as fwe:
+                            _log(
+                                f"  ⏳ #{qid} {it['link']}: FloodWait "
+                                f"{fwe.seconds}s при чтении статус-сообщения"
+                            )
+                            await asyncio.sleep(fwe.seconds)
+                        except Exception:
+                            pass
+
+                    if existing_msg is not None:
+                        status_msgs[key] = existing_msg
+                    elif it.get("status") in (
+                        "pending", "downloading", "downloaded", "uploading"
+                    ):
+                        # Для активных статусов — создаём новое сообщение
+                        try:
+                            text = _initial_status_text(it)
+                            m = await client.send_message("me", text)
+                            status_msgs[key] = m
+                            it["status_msg_id"] = m.id
+                            it["slot_msg_id"] = m.id
+                            _log(
+                                f"  ➕ #{qid} {it['link']}: создан статус "
+                                f"(id={m.id})"
+                            )
+                        except FloodWaitError as fwe:
+                            _log(
+                                f"  ⏳ #{qid} {it['link']}: FloodWait "
+                                f"{fwe.seconds}s при создании статуса"
+                            )
+                            await asyncio.sleep(fwe.seconds)
+                            try:
+                                m = await client.send_message(
+                                    "me", _initial_status_text(it)
+                                )
+                                status_msgs[key] = m
+                                it["status_msg_id"] = m.id
+                                it["slot_msg_id"] = m.id
+                            except Exception as e:
+                                _log(
+                                    f"  ⚠️  #{qid} {it['link']}: не удалось "
+                                    f"создать статус: {e}"
+                                )
+                        except Exception as e:
+                            _log(
+                                f"  ⚠️  #{qid} {it['link']}: не удалось "
+                                f"создать статус: {e}"
+                            )
+
+                # Создаём batch
+                batches[qid] = {
+                    "event": _make_fake_event(),
+                    "links": [
+                        (it["chat_id"], it["msg_id"], it["link"])
+                        for it in items
+                    ],
+                    "status_msgs": status_msgs,
+                    "link_states": link_states,
+                    "lock": asyncio.Lock(),
+                    "reorder_lock": asyncio.Lock(),
+                    "reorder_state": {
+                        "running": False, "pending": False, "last": 0.0,
+                    },
+                    "total": len(items),
+                    "ok": sum(
+                        1 for it in items if it.get("status") == "done"
+                    ),
+                    "skip": sum(
+                        1 for it in items if it.get("status") == "skip"
+                    ),
+                    "fail": sum(
+                        1 for it in items if it.get("status") == "fail"
+                    ),
+                    "finished": False,
+                    "to_delete": [],
+                }
+                _save_queue(qid)
+                _log(
+                    f"  🆕 #{qid}: создан batch для восстановления "
+                    f"(total={len(items)}, "
+                    f"pending={len(pending_items)}, "
+                    f"status_msgs={len(status_msgs)})"
+                )
+            else:
+                # batch уже есть — обновим только pending-статусы
+                for it in pending_items:
+                    key = (it["chat_id"], it["msg_id"])
+                    if key not in b["link_states"]:
+                        b["link_states"][key] = {
+                            "status": "pending",
+                            "percent": 0.0, "current": 0, "total": 0,
+                            "last_cb": 0.0, "last_edit": 0.0,
+                            "up_current": 0, "up_total": 0,
+                            "up_percent": 0.0, "last_up_cb": 0.0,
+                        }
+                    else:
+                        b["link_states"][key]["status"] = "pending"
+
+            # Ставим pending в link_queue
+            placed = 0
+            for it in pending_items:
+                try:
+                    await link_queue.put(
+                        (it["chat_id"], it["msg_id"], it["link"], qid)
+                    )
+                    placed += 1
+                    _log(
+                        f"  📥 #{qid} {it['link']}: pending → "
+                        f"в очередь на скачивание"
+                    )
+                except Exception as e:
+                    _log(
+                        f"  ❌ #{qid} {it['link']}: не удалось поставить "
+                        f"pending в очередь: {type(e).__name__}: {e}"
+                    )
+            if placed:
+                _log(
+                    f"  📤 #{qid}: поставлено pending в очередь: {placed}"
+                )
+
+        # ✅ Закрываем очередь, если после обработки uploading
+        # все элементы оказались в терминальных статусах.
         _close_queue_if_finished(qid)
 
 
 def _close_queue_if_finished(qid: int) -> bool:
-    """
-    Закрывает JSON-очередь, если все её элементы в терминальных статусах
-    (done/fail/skip). Удаляет JSON с диска и чистит память.
-
-    Возвращает True, если очередь была закрыта.
-
-    НЕ трогает статус-сообщения в me — они либо уже удалены
-    (для done), либо остаются как «❌/⚠️» без обновления.
-    Это приемлемо при старте: пользователь видит результат
-    восстановления и может удалить вручную.
-    """
+    # ✅ Не трогаем JSON, если batch активен — пусть _maybe_finish_batch
+    #    сделает финальную перетусовку и закроет сам.
+    b = batches.get(qid)
+    if b is not None and not b.get("finished"):
+        return False
+    
     q = queues.get(qid) or _load_queue(qid)
     if q is None:
         return False
@@ -1646,17 +1965,168 @@ async def offer_send_downloaded():
     placed = 0
     failed: list[tuple[int, dict, str]] = []   # (qid, it, причина)
 
+    # ============================================================
+    # ✅ ЭТАП 0. Восстановление batch для qid, у которых его нет в памяти.
+    #
+    # Типичный случай: в JSON-очереди остались только downloaded/uploading
+    # элементы, но НЕТ pending. Тогда resume_pending_queues() не создаёт
+    # batch (там создание только при наличии pending_items), и
+    # offer_send_downloaded падал в failed с причиной
+    # "batch не восстановлен" — файл никогда не отправлялся.
+    #
+    # Теперь: для каждого qid без batch — создаём его из JSON.
+    # ============================================================
+    missing_qids = {qid for qid, _ in items if qid not in batches}
+    for qid in missing_qids:
+        q = _load_queue(qid)
+        if not q:
+            _log(f"  ⚠️  #{qid}: JSON не читается — batch не восстановлен")
+            continue
+
+        q_items = q.get("items", [])
+        if not q_items:
+            _log(f"  ⚠️  #{qid}: очередь пустая — batch не восстановлен")
+            continue
+
+        try:
+            status_msgs: dict[tuple, any] = {}
+            link_states: dict[tuple, dict] = {}
+
+            for it in q_items:
+                key = (it["chat_id"], it["msg_id"])
+
+                # link_states для всех элементов, чтобы reconcile
+                # и _update_status_msg работали корректно
+                link_states[key] = {
+                    "status": it.get("status", "downloaded"),
+                    "percent": 0.0,
+                    "current": 0,
+                    "total": 0,
+                    "last_cb": 0.0,
+                    "last_edit": 0.0,
+                    "up_current": 0,
+                    "up_total": 0,
+                    "up_percent": 0.0,
+                    "last_up_cb": 0.0,
+                }
+
+                # Пробуем переиспользовать существующее статус-сообщение
+                mid = it.get("status_msg_id") or it.get("slot_msg_id")
+                if mid:
+                    try:
+                        m = await client.get_messages("me", ids=mid)
+                        if m:
+                            status_msgs[key] = m
+                    except FloodWaitError as fwe:
+                        _log(
+                            f"  ⏳ #{qid} {it['link']}: FloodWait "
+                            f"{fwe.seconds}s при чтении статус-сообщения"
+                        )
+                        await asyncio.sleep(fwe.seconds)
+                        try:
+                            m = await client.get_messages("me", ids=mid)
+                            if m:
+                                status_msgs[key] = m
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                # Для активных статусов без сообщения — создаём новое,
+                # иначе статус не будет обновляться при отправке
+                if key not in status_msgs and it.get("status") in (
+                    "pending", "downloading", "downloaded", "uploading"
+                ):
+                    try:
+                        m = await client.send_message(
+                            "me", _initial_status_text(it)
+                        )
+                        status_msgs[key] = m
+                        it["status_msg_id"] = m.id
+                        it["slot_msg_id"] = m.id
+                        _log(
+                            f"  ➕ #{qid} {it['link']}: создан статус "
+                            f"(id={m.id})"
+                        )
+                    except FloodWaitError as fwe:
+                        _log(
+                            f"  ⏳ #{qid} {it['link']}: FloodWait "
+                            f"{fwe.seconds}s при создании статуса"
+                        )
+                        await asyncio.sleep(fwe.seconds)
+                        try:
+                            m = await client.send_message(
+                                "me", _initial_status_text(it)
+                            )
+                            status_msgs[key] = m
+                            it["status_msg_id"] = m.id
+                            it["slot_msg_id"] = m.id
+                        except Exception as e:
+                            _log(
+                                f"  ⚠️  #{qid} {it['link']}: "
+                                f"статус не создан: {e}"
+                            )
+                    except Exception as e:
+                        _log(
+                            f"  ⚠️  #{qid} {it['link']}: "
+                            f"статус не создан: {e}"
+                        )
+
+            batches[qid] = {
+                "event": _make_fake_event(),
+                "links": [
+                    (it["chat_id"], it["msg_id"], it["link"])
+                    for it in q_items
+                ],
+                "status_msgs": status_msgs,
+                "link_states": link_states,
+                "lock": asyncio.Lock(),
+                "reorder_lock": asyncio.Lock(),
+                "reorder_state": {
+                    "running": False, "pending": False, "last": 0.0,
+                },
+                "total": len(q_items),
+                "ok": sum(1 for it in q_items if it.get("status") == "done"),
+                "skip": sum(1 for it in q_items if it.get("status") == "skip"),
+                "fail": sum(1 for it in q_items if it.get("status") == "fail"),
+                "finished": False,
+                "to_delete": [],
+            }
+            queues[qid] = q
+            _save_queue(qid)
+            _log(
+                f"  🆕 #{qid}: batch восстановлен в offer_send_downloaded "
+                f"(total={len(q_items)}, "
+                f"status_msgs={len(status_msgs)}, "
+                f"ok={batches[qid]['ok']}, "
+                f"fail={batches[qid]['fail']})"
+            )
+        except Exception as e:
+            _log(
+                f"  ⚠️  #{qid}: не удалось восстановить batch: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ============================================================
+    # ✅ ЭТАП 1. Постановка downloaded/uploading в link_queue
+    # ============================================================
     for qid, it in items:
         try:
             b = batches.get(qid)
             if b is None:
-                _log(f"  ⚠️  #{qid} {it['link']}: batch не восстановлен — пропуск")
+                # Не должны сюда попасть — этап 0 должен был создать batch.
+                # Но если _load_queue вернул None (битый JSON) — здесь.
+                _log(
+                    f"  ⚠️  #{qid} {it['link']}: batch не восстановлен — "
+                    f"пропуск"
+                )
                 failed.append((qid, it, "batch не восстановлен"))
                 continue
 
             key = (it["chat_id"], it["msg_id"])
 
-            # Гарантируем статус-сообщение
+            # Гарантируем статус-сообщение (страховка на случай,
+            # если этап 0 не смог создать из-за FloodWait)
             if key not in b["status_msgs"]:
                 old_id = it.get("status_msg_id")
                 m = None
@@ -1679,9 +2149,11 @@ async def offer_send_downloaded():
                     b["status_msgs"][key] = m
 
             b["link_states"].setdefault(key, {
-                "status": "downloaded", "percent": 0.0, "current": 0,
-                "total": 0, "last_cb": 0.0, "last_edit": 0.0,
-                "up_current": 0, "up_total": 0, "up_percent": 0.0, "last_up_cb": 0.0,
+                "status": "downloaded",
+                "percent": 0.0, "current": 0, "total": 0,
+                "last_cb": 0.0, "last_edit": 0.0,
+                "up_current": 0, "up_total": 0,
+                "up_percent": 0.0, "last_up_cb": 0.0,
             })
 
             await link_queue.put((it["chat_id"], it["msg_id"], it["link"], qid))
@@ -1690,8 +2162,10 @@ async def offer_send_downloaded():
 
         except Exception as e:
             # ✅ Ошибка одного элемента не ломает остальные
-            _log(f"  ❌ #{qid} {it['link']}: постановка не удалась: "
-                 f"{type(e).__name__}: {e}")
+            _log(
+                f"  ❌ #{qid} {it['link']}: постановка не удалась: "
+                f"{type(e).__name__}: {e}"
+            )
             failed.append((qid, it, f"{type(e).__name__}: {e}"))
 
     print(f"  📤 Поставлено в очередь на отправку: {placed}")
@@ -1706,8 +2180,8 @@ async def offer_send_downloaded():
             except Exception as e:
                 _log(f"  ⚠️  reconcile #{qid}: {e}")
 
-    # ✅ Возвращаем список «не поставленных» — пригодится для
-    # эскалации в main() (Уровень 3)
+    # ✅ Возвращаем список «не поставленных» — main() уведомит
+    # пользователя, если что-то не удалось.
     return failed
 
 # ---------- Отправка «ручных» файлов (не из JSON) ----------
@@ -1818,6 +2292,11 @@ async def enqueue_manual_files(paths: list[str]):
                 "up_current": 0, "up_total": 0,
                 "up_percent": 0.0, "last_up_cb": 0.0,
             }
+            try:
+                _fsize = os.path.getsize(path)
+            except Exception:
+                _fsize = 0
+
             items.append({
                 "chat_id": "me",
                 "msg_id": -idx,
@@ -1828,6 +2307,7 @@ async def enqueue_manual_files(paths: list[str]):
                 "file_message_id": None,
                 "local_file": name,
                 "downloaded_at": time.time(),
+                "file_size": _fsize,
             })
 
         _create_queue(batch_id, items)
@@ -2030,18 +2510,9 @@ async def handle_saved_messages(event):
     except Exception:
         pass
 
-# ---------- Запуск ----------
-async def main():
-    # Синхронизация batch_counter с существующими JSON
-    existing_ids = _list_queue_files()
-    if existing_ids:
-        batch_counter["id"] = max(existing_ids)
-        _log(f"🔢 batch_counter инициализирован: {batch_counter['id']}")
 
-    # --- 1. Классификация файлов в downloads/ (до любых удалений) ---
-    scan = _scan_downloads()
-
-    manual_send = False
+def _print_scan_summary(scan: dict):
+    """Информационный вывод о результатах скана downloads/."""
     if scan["manual"]:
         print(f"\n📂 Найдено файлов без записи в очереди: {len(scan['manual'])}")
         for f in scan["manual"][:20]:
@@ -2052,10 +2523,6 @@ async def main():
             print(f"   • {os.path.basename(f)} ({sz})")
         if len(scan["manual"]) > 20:
             print(f"   … и ещё {len(scan['manual']) - 20}")
-        ans = (await asyncio.to_thread(
-            input, "\nОтправить их в Избранное? [y/n]: "
-        )).strip().lower()
-        manual_send = ans in ("y", "yes", "да", "д")
 
     if scan["own_partial"]:
         print(
@@ -2067,10 +2534,6 @@ async def main():
         if len(scan["own_partial"]) > 20:
             print(f"   … и ещё {len(scan['own_partial']) - 20}")
 
-    # ✅ НОВЫЙ БЛОК: информируем о готовых к отправке файлах.
-    # _scan_downloads уже нашёл их (own_ready), но раньше мы не выводили.
-    # Теперь пользователь видит, что скрипт подхватил — до того, как
-    # offer_send_downloaded начнёт ставить их в link_queue.
     if scan["own_ready"]:
         print(
             f"\n📂 Найдено готовых к отправке файлов "
@@ -2082,40 +2545,22 @@ async def main():
         if len(scan["own_ready"]) > 20:
             print(f"   … и ещё {len(scan['own_ready']) - 20}")
 
-    session_file = os.path.join(BASE_DIR, "user_session.session")
-    had_session_file = os.path.exists(session_file)
+# ---------- Запуск ----------
+async def main():
+    # Синхронизация batch_counter с существующими JSON
+    existing_ids = _list_queue_files()
+    if existing_ids:
+        batch_counter["id"] = max(existing_ids)
+        _log(f"🔢 batch_counter инициализирован: {batch_counter['id']}")
 
-    print("⏳ Подключение к Telegram...")
-    await client.start()
+    # --- 1. Классификация файлов в downloads/ ---
+    scan = _scan_downloads()
+    _print_scan_summary(scan)
 
-    authorized = await client.is_user_authorized()
-    if not had_session_file or not authorized:
-        print("  📇 Первый запуск или сессия недействительна — загружаем диалоги...")
-        await client.get_dialogs()
-    else:
-        print("  📇 Сессия в порядке — диалоги не перезагружаем.")
-
-    me = await client.get_me()
-    account_state["is_premium"] = bool(getattr(me, "premium", False))
-    limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
-    print(
-        f"  👤 Аккаунт: @{me.username or me.id} "
-        f"({'Premium' if account_state['is_premium'] else 'Free'})"
-    )
-    print(f"  📦 Лимит на отправку: {human_size(limit)}")
-
-    workers = [
-        asyncio.create_task(link_worker(i + 1))
-        for i in range(CONCURRENT_DOWNLOADS)
-    ]
-    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
-
-    # ✅ Watchdog для зависших batch (элементы downloaded/uploading,
-    # которые не поставил offer_send_downloaded)
-    watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
-    print("  🐕 Запущен watchdog зависших пачек")
-
-    # --- 2. Разбираемся со «своими недокачанными» ---
+    # --- 2. «Свои недокачанные» → удаляем файл + JSON в pending ---
+    # ВАЖНО: делаем это ДО подключения — не требует client.
+    # После этого JSON-очереди содержат pending-элементы, которые
+    # подхватит resume_pending_queues().
     for qid, it, full in scan["own_partial"]:
         try:
             os.remove(full)
@@ -2123,7 +2568,6 @@ async def main():
         except Exception as e:
             _log(f"⚠️  не удалось удалить {full}: {e}")
 
-        # ✅ Правим JSON напрямую — не зависим от состояния `queues` в памяти.
         q = queues.get(qid) or _load_queue(qid)
         if q is None:
             _log(f"⚠️  очередь #{qid} не найдена — пропуск {it['link']}")
@@ -2147,23 +2591,103 @@ async def main():
         target["local_file"] = None
         target["downloaded_at"] = None
 
-        # Сохраняем на диск (и синхронизируем с памятью)
         queues[qid] = q
         _save_queue(qid)
 
         _log(f"♻️  {it['link']}: сброшен в pending — будет перекачан")
 
-    # --- 3. Штатное восстановление очередей ---
-    await resume_pending_queues()
-    await offer_send_downloaded()
+    # --- 3. Вопрос про manual-файлы (ДО подключения — быстрый ответ) ---
+    manual_send = False
+    if scan["manual"]:
+        ans = (await asyncio.to_thread(
+            input, "\nОтправить их в Избранное? [y/n]: "
+        )).strip().lower()
+        manual_send = ans in ("y", "yes", "да", "д")
+        if not manual_send:
+            print("   ⏭  Пропущено — спрошу при следующем запуске.")
 
-     # ✅ Дополнительная страховка: если offer_send_downloaded не поставил
-    # ничего в очередь (все downloaded-элементы потеряли файлы и стали fail),
-    # закрываем «мёртвые» JSON.
+    # --- 4. Подключение к Telegram ---
+    session_file = os.path.join(BASE_DIR, "user_session.session")
+    had_session_file = os.path.exists(session_file)
+
+    print("\n⏳ Подключение к Telegram...")
+    await client.start()
+
+    authorized = await client.is_user_authorized()
+    if not had_session_file or not authorized:
+        print("  📇 Первый запуск или сессия недействительна — загружаем диалоги...")
+        await client.get_dialogs()
+    else:
+        print("  📇 Сессия в порядке — диалоги не перезагружаем.")
+
+    me = await client.get_me()
+    account_state["is_premium"] = bool(getattr(me, "premium", False))
+    limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
+    print(
+        f"  👤 Аккаунт: @{me.username or me.id} "
+        f"({'Premium' if account_state['is_premium'] else 'Free'})"
+    )
+    print(f"  📦 Лимит на отправку: {human_size(limit)}")
+
+    # --- 5. Запуск воркеров и watchdog ---
+    workers = [
+        asyncio.create_task(link_worker(i + 1))
+        for i in range(CONCURRENT_DOWNLOADS)
+    ]
+    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
+
+    watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
+    print("  🐕 Запущен watchdog зависших пачек")
+
+    # --- 6. Восстановление очередей: pending → link_queue ---
+    await resume_pending_queues()
+
+    # --- 7. Постановка downloaded/uploading в очередь на отправку ---
+    # ✅ Сохраняем список «не поставленных» и логируем его.
+    # Это индикатор проблем: если failed не пуст — часть файлов
+    # не отправится автоматически, нужно вмешательство.
+    failed_send = await offer_send_downloaded()
+
+    if failed_send:
+        print(
+            f"\n⚠️  ВНИМАНИЕ: {len(failed_send)} файлов не удалось "
+            f"поставить в очередь на отправку:"
+        )
+        for qid, it, reason in failed_send:
+            print(f"   • #{qid} {it.get('link', '?')}: {reason}")
+
+        # ✅ Пытаемся уведомить пользователя в me — одна сводка,
+        # чтобы не спамить по каждому элементу.
+        try:
+            lines = [
+                f"⚠️ **Не удалось поставить в очередь: {len(failed_send)}**",
+                "",
+            ]
+            for qid, it, reason in failed_send[:10]:
+                lines.append(
+                    f"• `#{qid}` {it.get('link', '?')} — {reason}"
+                )
+            if len(failed_send) > 10:
+                lines.append(
+                    f"… и ещё {len(failed_send) - 10} "
+                    f"(см. логи в консоли)"
+                )
+            lines.append("")
+            lines.append(
+                "Файлы остались в `downloads/`, статусы в JSON — "
+                "`downloaded`. Будут повторены при следующем запуске."
+            )
+            await client.send_message("me", "\n".join(lines))
+        except Exception as e:
+            print(f"   ⚠️  не удалось уведомить в me: {e}")
+    else:
+        print("  ✅ Все найденные файлы поставлены в очередь на отправку")
+
+    # --- 8. Страховка: закрытие «мёртвых» JSON ---
     for qid in _list_queue_files():
         _close_queue_if_finished(qid)
 
-    # --- 4. «Ручные» файлы (y → создаём JSON + показываем прогресс) ---
+    # --- 9. Ручные файлы (после восстановления — приоритет у восстановления) ---
     if manual_send:
         await enqueue_manual_files(scan["manual"])
 
@@ -2189,25 +2713,19 @@ async def main():
         await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
         print("🛑 Завершение работы...")
     finally:
-        # ✅ Останавливаем watchdog раньше воркеров — чтобы он не начал
-        # новую постановку в очередь во время завершения
         watchdog_task.cancel()
-
         for w in workers:
             w.cancel()
         await asyncio.gather(
             watchdog_task, *workers, return_exceptions=True
         )
-
         if _pending_deletions:
             await asyncio.gather(*_pending_deletions, return_exceptions=True)
-
         await asyncio.sleep(0.5)
         try:
             await client.disconnect()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     logging.basicConfig(
