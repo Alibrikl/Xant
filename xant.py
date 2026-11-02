@@ -313,6 +313,45 @@ def _list_queue_files() -> list[int]:
             ids.append(int(m.group(1)))
     return sorted(ids)
 
+def _scan_downloads() -> dict:
+    """
+    Классифицирует файлы в DOWNLOAD_DIR:
+      - manual:      файла нет в JSON-очередях (пользователь положил руками)
+      - own_partial: есть в JSON, статус pending/downloading (недокачан)
+      - own_ready:   есть в JSON, статус downloaded/uploading (готов к отправке)
+    """
+    own_by_name: dict[str, tuple[int, dict]] = {}
+    for qid in _list_queue_files():
+        q = _load_queue(qid)
+        if not q:
+            continue
+        for it in q.get("items", []):
+            lf = it.get("local_file")
+            if lf:
+                own_by_name[lf] = (qid, it)
+
+    manual: list[str] = []
+    own_partial: list[tuple[int, dict, str]] = []
+    own_ready: list[tuple[int, dict, str]] = []
+
+    if not os.path.isdir(DOWNLOAD_DIR):
+        return {"manual": manual, "own_partial": own_partial, "own_ready": own_ready}
+
+    for name in os.listdir(DOWNLOAD_DIR):
+        full = os.path.join(DOWNLOAD_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        entry = own_by_name.get(name)
+        if entry is None:
+            manual.append(full)
+        else:
+            qid, it = entry
+            if it.get("status") in ("pending", "downloading"):
+                own_partial.append((qid, it, full))
+            else:  # downloaded / uploading
+                own_ready.append((qid, it, full))
+
+    return {"manual": manual, "own_partial": own_partial, "own_ready": own_ready}
 
 # ---------- Скачивание ----------
 async def download_with_retry(
@@ -328,6 +367,8 @@ async def download_with_retry(
 
     suggested_filename = build_filename(target_msg)
     local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
+    if size_holder is not None:
+        size_holder["path"] = local_path
 
     attempt = 0
     while True:
@@ -350,6 +391,8 @@ async def download_with_retry(
                 return None
             suggested_filename = build_filename(target_msg)
             local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
+            if size_holder is not None:
+                size_holder["path"] = local_path
         except FloodWaitError as fwe:
             print(f"\n[FloodWait] Ждём {fwe.seconds} сек...")
             await asyncio.sleep(fwe.seconds)
@@ -771,6 +814,15 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             st["total"] = total
             st["percent"] = (current / total) * 100 if total else 0
             st["status"] = "downloading"
+            # Запоминаем local_file в JSON сразу, чтобы при аварии
+            # файл в downloads/ считался «нашим недокачанным», а не «ручным»
+            path = size_holder.get("path")
+            if path and not item.get("local_file"):
+                _mark_item(
+                    batch_id, chat_id, msg_id,
+                    status="downloading",
+                    local_file=os.path.basename(path),
+                )
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
@@ -1396,6 +1448,146 @@ async def upload_existing_downloads():
         pass
     _schedule_delete(status)
 
+# ---------- Отправка «ручных» файлов (не из JSON) ----------
+
+async def upload_manual_file(batch_id: int, item: dict, path: str):
+    """Загружает локальный файл в «Избранное», обновляя статус-сообщение."""
+    chat_id, msg_id = item["chat_id"], item["msg_id"]
+    batch = batches.get(batch_id)
+    if batch is None:
+        return
+    key = (chat_id, msg_id)
+    st = batch["link_states"].get(key)
+    if st is None:
+        return
+
+    full_link = item["link"]  # для ручных — это имя файла
+    display_name = os.path.basename(path)
+    file_size = os.path.getsize(path)
+
+    st["status"] = "uploading"
+    st["up_current"] = 0
+    st["up_total"] = file_size
+    st["up_percent"] = 0.0
+    st["last_up_cb"] = 0.0
+    _mark_item(batch_id, chat_id, msg_id, status="uploading")
+    await _update_status_msg(batch, key, full_link, force=True)
+
+    async def upload_cb(current, total):
+        now = time.time()
+        if now - st.get("last_up_cb", 0) > 3 or current == total:
+            st["last_up_cb"] = now
+            st["up_current"] = current
+            st["up_total"] = total
+            st["up_percent"] = (current / total) * 100 if total else 0
+            if key in batch["status_msgs"]:
+                await _update_status_msg(batch, key, full_link)
+
+    async with upload_lock:
+        sent = await _send_media("me", path, display_name, upload_cb)
+
+    sent_msg = sent[0] if isinstance(sent, list) else sent
+    sent_id = getattr(sent_msg, "id", None)
+
+    _log(
+        f"✅ ручной файл загружен в «Избранное»: {display_name} "
+        f"→ сообщение id={sent_id}, размер={human_size(file_size)}"
+    )
+
+    _mark_item(
+        batch_id, chat_id, msg_id,
+        status="done",
+        file_message_id=sent_id,
+        local_file=None,
+        downloaded_at=None,
+    )
+    st["status"] = "done"
+
+    status_msg = batch["status_msgs"].pop(key, None)
+    if status_msg is not None:
+        try:
+            await status_msg.delete()
+        except Exception as e:
+            _log(f"⚠️  не удалось удалить статус ручного файла: {e}")
+
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            _log(f"🧹 удалён локальный файл: {display_name}")
+    except Exception as e:
+        _log(f"⚠️  не удалось удалить {display_name}: {e}")
+
+
+async def _run_manual_upload(batch_id: int, item: dict, path: str):
+    b = batches.get(batch_id)
+    try:
+        await upload_manual_file(batch_id, item, path)
+        if b is not None:
+            b["ok"] += 1
+    except Exception as e:
+        _log(f"❌ ручной файл {os.path.basename(path)}: {type(e).__name__}: {e}")
+        _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail")
+        if b is not None:
+            b["fail"] += 1
+    finally:
+        await _maybe_finish_batch(batch_id)
+
+
+async def enqueue_manual_files(paths: list[str]):
+    """Создаёт batch для «ручных» файлов и запускает их загрузку."""
+    if not paths:
+        return
+
+    batch_counter["id"] += 1
+    batch_id = batch_counter["id"]
+
+    items, link_states, status_msgs = [], {}, {}
+
+    for idx, path in enumerate(paths, start=1):
+        name = os.path.basename(path)
+        status_msg = await client.send_message(
+            "me", f"📋 {name} (локальный файл)"
+        )
+        # синтетический ключ: chat_id = "me" (строка), msg_id = отрицательный
+        key = ("me", -idx)
+        status_msgs[key] = status_msg
+        link_states[key] = {
+            "status": "downloaded",
+            "percent": 0.0, "current": 0, "total": 0,
+            "last_cb": 0.0, "last_edit": 0.0,
+            "up_current": 0, "up_total": 0, "up_percent": 0.0, "last_up_cb": 0.0,
+        }
+        items.append({
+            "chat_id": "me",
+            "msg_id": -idx,
+            "link": name,
+            "status": "downloaded",
+            "status_msg_id": status_msg.id,
+            "slot_msg_id": None,
+            "file_message_id": None,
+            "local_file": name,
+            "downloaded_at": time.time(),
+        })
+
+    _create_queue(batch_id, items)
+    batches[batch_id] = {
+        "event": _make_fake_event(),
+        "links": [(it["chat_id"], it["msg_id"], it["link"]) for it in items],
+        "status_msgs": status_msgs,
+        "link_states": link_states,
+        "lock": asyncio.Lock(),
+        "reorder_lock": asyncio.Lock(),
+        "reorder_state": {"running": False, "pending": False, "last": 0.0},
+        "total": len(items),
+        "ok": 0, "skip": 0, "fail": 0,
+        "finished": False,
+        "to_delete": [],
+    }
+
+    for it in items:
+        path = os.path.join(DOWNLOAD_DIR, it["local_file"])
+        asyncio.create_task(_run_manual_upload(batch_id, it, path))
+
 # ---------- Обработчик сообщений ----------
 @client.on(events.NewMessage(chats="me"))
 async def handle_saved_messages(event):
@@ -1545,19 +1737,35 @@ async def handle_saved_messages(event):
 
 # ---------- Запуск ----------
 async def main():
-    files_in_downloads = [
-        f for f in os.listdir(DOWNLOAD_DIR)
-        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
-    ]
-    send_old = False
-    if files_in_downloads:
-        print(f"\n📂 В папке `{DOWNLOAD_DIR}/` найдено {len(files_in_downloads)} файл(ов):")
-        for f in files_in_downloads[:20]:
-            print(f"   • {f} ({human_size(os.path.getsize(os.path.join(DOWNLOAD_DIR, f)))})")
-        if len(files_in_downloads) > 20:
-            print(f"   … и ещё {len(files_in_downloads) - 20}")
-        answer = input("\nОтправить их в Избранное? [y/n]: ").strip().lower()
-        send_old = answer in ("y", "yes", "да", "д")
+    # --- 1. Классификация файлов в downloads/ (до любых удалений) ---
+    scan = _scan_downloads()
+
+    manual_send = False
+    if scan["manual"]:
+        print(f"\n📂 Найдено файлов без записи в очереди: {len(scan['manual'])}")
+        for f in scan["manual"][:20]:
+            try:
+                sz = human_size(os.path.getsize(f))
+            except Exception:
+                sz = "?"
+            print(f"   • {os.path.basename(f)} ({sz})")
+        if len(scan["manual"]) > 20:
+            print(f"   … и ещё {len(scan['manual']) - 20}")
+        ans = input("\nОтправить их в Избранное? [y/n]: ").strip().lower()
+        manual_send = ans in ("y", "yes", "да", "д")
+
+    partial_send = False
+    if scan["own_partial"]:
+        print(
+            f"\n📂 Найдено недокачанных файлов "
+            f"(есть запись в очереди): {len(scan['own_partial'])}"
+        )
+        for _, it, f in scan["own_partial"][:20]:
+            print(f"   • {os.path.basename(f)} ← {it['link']}")
+        if len(scan["own_partial"]) > 20:
+            print(f"   … и ещё {len(scan['own_partial']) - 20}")
+        ans = input("\nПерекачать их заново? [y/n]: ").strip().lower()
+        partial_send = ans in ("y", "yes", "да", "д")
 
     session_file = os.path.join(BASE_DIR, "user_session.session")
     had_session_file = os.path.exists(session_file)
@@ -1587,12 +1795,38 @@ async def main():
     ]
     print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
 
-    await cleanup_orphan_files()
+    # --- 2. Разбираемся со «своими недокачанными» ---
+    for qid, it, full in scan["own_partial"]:
+        try:
+            os.remove(full)
+            _log(f"🧹 удалён недокачанный файл: {os.path.basename(full)}")
+        except Exception as e:
+            _log(f"⚠️  не удалось удалить {full}: {e}")
+
+        if partial_send:
+            # y — сбросить в pending, resume_pending_queues перекачает
+            _mark_item(
+                qid, it["chat_id"], it["msg_id"],
+                status="pending",
+                local_file=None,
+                downloaded_at=None,
+            )
+        else:
+            # n — стереть из активной работы
+            _mark_item(
+                qid, it["chat_id"], it["msg_id"],
+                status="skip",
+                local_file=None,
+                downloaded_at=None,
+            )
+
+    # --- 3. Штатное восстановление очередей ---
     await resume_pending_queues()
     await offer_send_downloaded()
 
-    if send_old:
-        await upload_existing_downloads()
+    # --- 4. «Ручные» файлы (y → создаём JSON + показываем прогресс) ---
+    if manual_send:
+        await enqueue_manual_files(scan["manual"])
 
     print(
         f"\n🚀 Готово!\n"
