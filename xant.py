@@ -1318,11 +1318,24 @@ async def handle_saved_messages(event):
         "total": len(link_states),
         "ok": 0, "skip": 0, "fail": 0,
         "finished": False,
-        "to_delete": [event.message],
+        "to_delete": [],          # ← исходное сообщение больше не откладываем
     }
 
     for chat_id, msg_id, full_link in links:
         await link_queue.put((chat_id, msg_id, full_link, batch_id))
+
+    # Исходное сообщение со ссылками больше не нужно — удаляем сразу
+    try:
+        await event.message.delete()
+    except FloodWaitError as fwe:
+        print(f"\n[FloodWait] Пауза {fwe.seconds} сек. перед удалением исходного сообщения...")
+        await asyncio.sleep(fwe.seconds)
+        try:
+            await event.message.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 # ---------- Запуск ----------
 async def main():
