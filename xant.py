@@ -357,6 +357,7 @@ def _scan_downloads() -> dict:
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
     size_holder: dict | None = None, max_retries: int = 3,
+    on_path_known=None,
 ):
     target_msg = await client.get_messages(chat_id, ids=msg_id)
     if not target_msg or not target_msg.media:
@@ -369,6 +370,8 @@ async def download_with_retry(
     local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
     if size_holder is not None:
         size_holder["path"] = local_path
+    if on_path_known is not None:
+        on_path_known(local_path)
 
     attempt = 0
     while True:
@@ -393,6 +396,8 @@ async def download_with_retry(
             local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
             if size_holder is not None:
                 size_holder["path"] = local_path
+            if on_path_known is not None:
+                on_path_known(local_path)
         except FloodWaitError as fwe:
             print(f"\n[FloodWait] Ждём {fwe.seconds} сек...")
             await asyncio.sleep(fwe.seconds)
@@ -835,8 +840,18 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             _mark_item(batch_id, chat_id, msg_id, status="downloaded")
             await _update_status_msg(batch, key, full_link, force=True)
         else:
+            def _on_path(path):
+                if not item.get("local_file"):
+                    _mark_item(
+                        batch_id, chat_id, msg_id,
+                        status="downloading",
+                        local_file=os.path.basename(path),
+                    )
+
             filename = await download_with_retry(
-                chat_id, msg_id, download_cb, size_holder=size_holder,
+                chat_id, msg_id, download_cb,
+                size_holder=size_holder,
+                on_path_known=_on_path,
             )
             if not filename:
                 st["status"] = "fail"
@@ -1033,7 +1048,8 @@ async def _maybe_finish_batch(batch_id: int):
     except Exception as e:
         _log(f"batch #{batch_id}: ошибка перетусовки: {e}")
 
-    if b["fail"] > 0 or b["skip"] > 0:
+    # Для ручных batch summary не отправляем — они не «пачки ссылок»
+    if not b.get("is_manual") and (b["fail"] > 0 or b["skip"] > 0):
         summary_msg = await b["event"].respond(
             f"✅ **Пачка обработана!**\n"
             f"├ Успешно: {b['ok']}\n"
@@ -1119,12 +1135,26 @@ async def resume_pending_queues():
         pending = [
             it for it in items
             if it["status"] in ("pending", "downloading", "fail")
+            and not (
+                it.get("chat_id") == "me"
+                and isinstance(it.get("msg_id"), int)
+                and it["msg_id"] < 0
+            )
         ]
         to_send = [
             it for it in items
             if it["status"] in ("downloaded", "uploading")
         ]
         done = [it for it in items if it["status"] == "done"]
+
+        # Ручные файлы в fail — перекачать нельзя, помечаем skip и убираем из очереди
+        for it in items:
+            if (it.get("chat_id") == "me"
+                    and isinstance(it.get("msg_id"), int)
+                    and it["msg_id"] < 0
+                    and it["status"] == "fail"):
+                _mark_item(qid, it["chat_id"], it["msg_id"],
+                           status="skip", local_file=None)
 
         if not pending and not to_send:
             _log(
@@ -1582,6 +1612,7 @@ async def enqueue_manual_files(paths: list[str]):
         "ok": 0, "skip": 0, "fail": 0,
         "finished": False,
         "to_delete": [],
+        "is_manual": True,
     }
 
     for it in items:
