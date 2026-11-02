@@ -1325,13 +1325,17 @@ async def main():
     )
 
     try:
+        disconnect_task = asyncio.ensure_future(client.disconnected)
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
         await asyncio.wait(
-            [
-                asyncio.create_task(client.disconnected),
-                asyncio.create_task(shutdown_event.wait()),
-            ],
+            [disconnect_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+        # отменяем оставшуюся задачу, чтобы не висела
+        for t in (disconnect_task, shutdown_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
         print("🛑 Завершение работы...")
     finally:
         for w in workers:
