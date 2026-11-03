@@ -40,8 +40,6 @@ REORDER_DEBOUNCE = 3.0
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"}
 
-batch_create_lock = asyncio.Lock()
-
 if not os.path.exists(ENV_FILE):
     print("==================================================")
     print("🚀 Добро пожаловать в Xant")
@@ -79,7 +77,6 @@ LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 # extract_all_links вернул бы [] → ссылка проигнорирована молча.
 LINK_REGEX = re.compile(LINK_PATTERN, re.IGNORECASE)
 
-link_queue: asyncio.Queue = asyncio.Queue()
 processed: set[tuple] = set()
 cancel_flag = {"cancel": False}
 in_progress = {"count": 0}
@@ -87,12 +84,14 @@ in_progress = {"count": 0}
 batches: dict[int, dict] = {}
 batch_counter = {"id": 0}
 
-upload_lock = asyncio.Lock()
 account_state = {"is_premium": False}
 
 queues: dict[int, dict] = {}
 
-shutdown_event = asyncio.Event()
+link_queue = None
+batch_create_lock = None
+upload_lock = None
+shutdown_event = None
 
 _pending_deletions: set[asyncio.Task] = set()
 
@@ -2547,6 +2546,11 @@ def _print_scan_summary(scan: dict):
 
 # ---------- Запуск ----------
 async def main():
+    global link_queue, batch_create_lock, shutdown_event, upload_lock
+    link_queue = asyncio.Queue()
+    batch_create_lock = asyncio.Lock()
+    shutdown_event = asyncio.Event()
+    upload_lock = asyncio.Lock()
     # Синхронизация batch_counter с существующими JSON
     existing_ids = _list_queue_files()
     if existing_ids:
@@ -2734,7 +2738,7 @@ if __name__ == "__main__":
     )
     logging.getLogger("telethon").setLevel(logging.WARNING)
     try:
-        client.run(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Остановлено пользователем (Ctrl+C).")
     except Exception as crash_error:
