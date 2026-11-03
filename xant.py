@@ -1000,12 +1000,11 @@ async def request_reconcile(batch_id: int, force: bool = False):
 # ---------- Хелпер ----------
 def _release_processed(key: tuple, result: str) -> str:
     """
-    Снимает блокировку processed, если элемент НЕ отложен.
-    'deferred' оставляем в processed — watchdog подхватит.
-    Возвращает result без изменений (удобно для `return _release_processed(...)`).
+    Снимает блокировку processed ВСЕГДА.
+    'deferred' — элемент отложен, watchdog/рестарт подхватит;
+    processed не должен блокировать повторную попытку.
     """
-    if result != "deferred":
-        processed.discard(key)
+    processed.discard(key)
     return result
 
 # ---------- Обработка одной ссылки ----------
