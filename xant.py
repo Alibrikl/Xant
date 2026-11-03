@@ -660,11 +660,13 @@ def _get_send_kind(path: str) -> str:
     return "document"
 
 
-async def _send_media(chat, path: str, display_name: str, progress_cb=None):
+async def _send_media(chat, path: str, display_name: str, progress_cb=None,
+                      caption: str | None = None):
     kind = _get_send_kind(path)
     name_attr = DocumentAttributeFilename(display_name)
 
     if kind == "video":
+        # ✅ caption только для видео (у остальных — не показываем подпись)
         d, w, h = await asyncio.to_thread(_video_meta_sync, path)
         if w > 0 and h > 0:
             return await client.send_file(
@@ -675,12 +677,14 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None):
                     ),
                     name_attr,
                 ],
+                caption=caption,
                 progress_callback=progress_cb,
             )
         return await client.send_file(
             chat, path,
             force_document=True,
             attributes=[name_attr],
+            caption=caption,
             progress_callback=progress_cb,
         )
     elif kind == "audio":
@@ -688,6 +692,7 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None):
         return await client.send_file(
             chat, path,
             attributes=[DocumentAttributeAudio(duration=d), name_attr],
+            # ✅ caption=None — не передаём подпись для аудио
             progress_callback=progress_cb,
         )
     else:
@@ -695,9 +700,9 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None):
             chat, path,
             force_document=True,
             attributes=[name_attr],
+            # ✅ caption=None — не передаём подпись для документов
             progress_callback=progress_cb,
         )
-
 
 # ---------- Статусы ----------
 def _render_status(st: dict, full_link: str) -> str:
@@ -1233,9 +1238,14 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 if key in batch["status_msgs"]:
                     await _update_status_msg(batch, key, full_link)
 
-        async with upload_lock:
-            sent = await _send_media("me", filename, display_name, upload_cb)
+        # ✅ Caption — только для видео (для аудио/документов — без подписи)
+        caption = None
+        if _get_send_kind(filename) == "video":
+            caption = f"🎬 {display_name}"
 
+        async with upload_lock:
+            sent = await _send_media("me", filename, display_name, upload_cb, caption=caption)
+            
         sent_msg = sent[0] if isinstance(sent, list) else sent
         sent_id = getattr(sent_msg, "id", None)
 
@@ -2428,8 +2438,16 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
+    # ✅ Caption — только для видео (manual)
+    manual_caption = None
+    if _get_send_kind(path) == "video":
+        manual_caption = f"🎬 {display_name}"
+
     async with upload_lock:
-        sent = await _send_media("me", path, display_name, upload_cb)
+        sent = await _send_media(
+            "me", path, display_name, upload_cb,
+            caption=manual_caption,
+        )
 
     sent_msg = sent[0] if isinstance(sent, list) else sent
     sent_id = getattr(sent_msg, "id", None)
