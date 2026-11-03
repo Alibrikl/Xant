@@ -410,7 +410,10 @@ def _mark_item(batch_id: int, chat_id, msg_id, **fields):
         )
         return
     it.update(fields)
-    _save_queue(batch_id)
+    # ✅ Manual-батчи не сохраняем на диск — при рестарте
+    # пользователь снова ответит y/n (лучше, чем дубликат)
+    if not batches.get(batch_id, {}).get("is_manual"):
+        _save_queue(batch_id)
 
 
 def _list_queue_files() -> list[int]:
@@ -1493,6 +1496,9 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
             for batch_id, b in list(batches.items()):
                 if b.get("finished"):
                     continue
+                # ✅ Не трогаем manual-батчи — их обрабатывает _run_manual_upload
+                if b.get("is_manual"):
+                    continue
                 q = queues.get(batch_id)
                 if q is None:
                     continue
@@ -2384,7 +2390,11 @@ async def enqueue_manual_files(paths: list[str]):
                 "file_size": _fsize,
             })
 
-        _create_queue(batch_id, items)
+        # ✅ НЕ создаём JSON для manual-батчей — они не должны
+        # переживать рестарт. queues[batch_id] создаём только в памяти.
+        q = {"batch_id": batch_id, "path": _queue_path(batch_id), "items": items}
+        queues[batch_id] = q
+
         batches[batch_id] = {
             "event": _make_fake_event(),
             "links": [(it["chat_id"], it["msg_id"], it["link"]) for it in items],
