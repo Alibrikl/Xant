@@ -326,23 +326,21 @@ async def _find_in_me(display_name: str, file_size: int | None,
             m = await client.get_messages("me", ids=cached)
             if m is None:
                 _find_cache.pop(cache_key, None)
-                # проваливаемся в поиск ниже
             else:
                 _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
                 return cached
         except Exception:
-            # не смогли проверить — доверяем кэшу
             return cached
 
     check_size = bool(file_size and file_size > 0)
     attempt = 0
     while True:
         try:
-            # 2) Серверный поиск по имени — в разы дешевле полного скана
+            # ✅ Серверный search=display_name не работает для имён файлов
+            # (Telegram ищет по тексту сообщений, не по DocumentAttributeFilename).
+            # Сразу полный скан — экономит один бесполезный запрос.
             found: int | None = None
-            async for msg in client.iter_messages(
-                "me", search=display_name, limit=20
-            ):
+            async for msg in client.iter_messages("me", limit=scan_limit):
                 if not msg.file:
                     continue
                 if msg.file.name != display_name:
@@ -354,24 +352,6 @@ async def _find_in_me(display_name: str, file_size: int | None,
                 found = msg.id
                 break
 
-            # 3) Фолбэк: если серверный поиск ничего не дал — полный скан
-            #    (редкий случай: спецсимволы в имени, поиск не сработал)
-            if found is None:
-                async for msg in client.iter_messages("me", limit=scan_limit):
-                    if not msg.file:
-                        continue
-                    if msg.file.name != display_name:
-                        continue
-                    if check_size:
-                        size = getattr(msg.file, "size", 0) or 0
-                        if size != file_size:
-                            continue
-                    found = msg.id
-                    break
-
-            # 4) Кэшируем ТОЛЬКО успешную находку.
-            #    None — не кэшируем: файл мог ещё не долететь до me,
-            #    или появиться позже (watchdog, повторная отправка).
             if found is not None:
                 _find_cache[cache_key] = found
                 _log(
@@ -397,7 +377,6 @@ async def _find_in_me(display_name: str, file_size: int | None,
             await asyncio.sleep(fwe.seconds)
         except Exception as e:
             _log(f"  ⚠️  _find_in_me({display_name}): {type(e).__name__}: {e}")
-            # Не кэшируем ошибки — пусть попробует в следующий раз
             return None
 
 def _mark_item(batch_id: int, chat_id, msg_id, **fields):
@@ -1494,13 +1473,70 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
             await asyncio.sleep(interval)
             now = time.time()
             for batch_id, b in list(batches.items()):
-                if b.get("finished"):
-                    continue
-                # ✅ Не трогаем manual-батчи — их обрабатывает _run_manual_upload
-                if b.get("is_manual"):
-                    continue
+                # ✅ Определяем q ДО всех проверок — используется и в manual,
+                # и в обычной ветке.
                 q = queues.get(batch_id)
                 if q is None:
+                    continue
+
+                if b.get("is_manual"):
+                    # ✅ Исключаем элементы, которые уже в работе
+                    uploading_keys = b.get("_uploading", set())
+                    stuck_manual = [
+                        it for it in q.get("items", [])
+                        if it.get("status") in ("downloaded", "uploading")
+                        and (it["chat_id"], it["msg_id"]) not in uploading_keys
+                    ]
+                    if not stuck_manual:
+                        continue
+                    # Аналогичная логика таймаута (60+60 сек)
+                    mkey = tuple(id(it) for it in stuck_manual)
+                    mwd = b.setdefault("_wd_manual", {})
+                    if mwd.get("key") != mkey:
+                        mwd["key"] = mkey
+                        mwd["ts"] = now
+                        _log(
+                            f"🐕 watchdog (manual): batch #{batch_id} — "
+                            f"{len(stuck_manual)} зависших. Дам {interval:.0f}s..."
+                        )
+                        continue
+                    if now - mwd.get("ts", now) < interval:
+                        continue
+
+                    for it in stuck_manual:
+                        local = it.get("local_file")
+                        if not local or not os.path.exists(
+                                os.path.join(DOWNLOAD_DIR, local)):
+                            _mark_item(batch_id, it["chat_id"], it["msg_id"],
+                                       status="fail", local_file=None)
+                            b["fail"] = b.get("fail", 0) + 1
+                            _log(f"  🐕 #{batch_id} {it['link']}: файл пропал → fail")
+                            continue
+                        retries = it.get("upload_retries", 0)
+                        if retries >= 3:
+                            _mark_item(batch_id, it["chat_id"], it["msg_id"],
+                                       status="fail", local_file=None)
+                            b["fail"] = b.get("fail", 0) + 1
+                            _log(
+                                f"  🐕 #{batch_id} {it['link']}: "
+                                f"превышено попыток ({retries}) → fail"
+                            )
+                            continue
+                        _mark_item(batch_id, it["chat_id"], it["msg_id"],
+                                   upload_retries=retries + 1,
+                                   status="downloaded")
+                        asyncio.create_task(
+                            _run_manual_upload(
+                                batch_id, it,
+                                os.path.join(DOWNLOAD_DIR, local)
+                            )
+                        )
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"повторно в manual upload (попытка {retries + 1}/3)"
+                        )
+                    await _maybe_finish_batch(batch_id)
+                    mwd["key"] = None
                     continue
 
                 # downloaded — безопасно переотправить
@@ -1786,6 +1822,7 @@ async def resume_pending_queues():
                 f"  📊 #{qid}: uploading → done={uploading_done}, "
                 f"→ downloaded={uploading_downloaded}, → fail={uploading_fail}"
             )
+            _save_queue(qid)      # ← СОХРАНИТЬ прямые правки
 
         # ============================================================
         # ЭТАП 2. Обработка pending-элементов (перекачка)
@@ -2335,6 +2372,13 @@ async def upload_manual_file(batch_id: int, item: dict, path: str):
 
 async def _run_manual_upload(batch_id: int, item: dict, path: str):
     b = None
+    key = (item["chat_id"], item["msg_id"])
+    
+    # ✅ Помечаем как «в работе» для watchdog
+    b_init = batches.get(batch_id)
+    if b_init is not None:
+        b_init.setdefault("_uploading", set()).add(key)
+    
     try:
         await upload_manual_file(batch_id, item, path)
         b = batches.get(batch_id)
@@ -2343,9 +2387,14 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
     except Exception as e:
         _log(f"❌  Файл {os.path.basename(path)}: {type(e).__name__}: {e}")
         _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail")
+        b = batches.get(batch_id)
         if b is not None:
             b["fail"] += 1
     finally:
+        # ✅ Снимаем флаг
+        b_fin = batches.get(batch_id)
+        if b_fin is not None:
+            b_fin.get("_uploading", set()).discard(key)
         await _maybe_finish_batch(batch_id)
 
 async def enqueue_manual_files(paths: list[str]):
