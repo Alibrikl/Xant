@@ -794,6 +794,11 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             for k in ("status_msg_id", "slot_msg_id"):
                 mid = it.get(k)
                 if mid:
+                    # ✅ done-слот НЕ удаляем: иначе reconcile форвардит
+                    # file_message_id заново, а оригинал остаётся в чате
+                    # → дубликаты файла.
+                    if it.get("status") == "done" and k == "slot_msg_id":
+                        continue
                     to_delete_ids.append(mid)
         to_delete_ids = list(dict.fromkeys(to_delete_ids))
 
@@ -853,52 +858,60 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             tag = f"item #{idx} {full_link} ({status})"
 
             if status == "done" and it.get("file_message_id"):
-                # Слот не удалён — НЕ пересылаем, иначе будет дубликат.
+                # ✅ Слот уже есть в чате — НЕ пересоздаём.
+                # Иначе forward_messages создаст копию file_message_id,
+                # а оригинал останется → дубликаты.
                 if it.get("slot_msg_id"):
                     _log(
                         f"  ⏭  ПРОПУСК пересылки {tag}: "
-                        f"старый слот {it['slot_msg_id']} не удалён "
-                        f"(иначе будет дубликат)"
+                        f"слот {it['slot_msg_id']} уже в чате"
                     )
                     continue
+
+                # Слот отсутствует (был удалён вручную или при краше).
+                # Оригинал file_message_id НЕ трогаем — он уже в чате.
+                # Создаём текстовый плейсхолдер как слот (без forward),
+                # чтобы slot_msg_id указывал на реально существующее
+                # сообщение и следующая перетусовка не сломалась.
                 try:
-                    fwd = await client.forward_messages(
-                        "me", it["file_message_id"], from_peer="me",
+                    msg = await client.send_message("me", f"✅ {full_link}")
+                    it["slot_msg_id"] = msg.id
+                    it["status_msg_id"] = None
+                    _save_queue(batch_id)
+                    _log(
+                        f"  ✅ {tag}: создан плейсхолдер {msg.id} "
+                        f"(оригинал {it['file_message_id']} не тронут)"
                     )
-                    slot_id = fwd[0].id if isinstance(fwd, list) else fwd.id
-                    _log(f"  ➕ переслан файл {tag}: новый слот {slot_id}")
                 except FloodWaitError as fwe:
-                    _log(f"  ⏳ FloodWait {fwe.seconds}s при пересылке {tag}")
+                    _log(
+                        f"  ⏳ FloodWait {fwe.seconds}s при создании "
+                        f"плейсхолдера {tag}"
+                    )
                     await asyncio.sleep(fwe.seconds)
                     try:
-                        fwd = await client.forward_messages(
-                            "me", it["file_message_id"], from_peer="me",
+                        msg = await client.send_message(
+                            "me", f"✅ {full_link}"
                         )
-                        slot_id = fwd[0].id if isinstance(fwd, list) else fwd.id
+                        it["slot_msg_id"] = msg.id
+                        it["status_msg_id"] = None
+                        _save_queue(batch_id)
                         _log(
-                            f"  ➕ переслан файл после FloodWait {tag}: "
-                            f"слот {slot_id}"
+                            f"  ✅ {tag}: создан плейсхолдер {msg.id} "
+                            f"(после FloodWait)"
                         )
                     except Exception as e:
-                        _log(f"  ❌ пересылка не удалась {tag}: {e}")
-                        msg = await client.send_message("me", f"✅ {full_link}")
-                        slot_id = msg.id
                         _log(
-                            f"  ➕ создан текстовый плейсхолдер {tag}: "
-                            f"слот {slot_id}"
+                            f"  ⚠️  {tag}: не удалось создать "
+                            f"плейсхолдер: {e}"
                         )
                 except Exception as e:
-                    _log(f"  ❌ пересылка не удалась {tag}: {e}")
-                    msg = await client.send_message("me", f"✅ {full_link}")
-                    slot_id = msg.id
                     _log(
-                        f"  ➕ создан текстовый плейсхолдер {tag}: "
-                        f"слот {slot_id}"
+                        f"  ⚠️  {tag}: не удалось создать "
+                        f"плейсхолдер: {e}"
                     )
+                # slot_msg_id останется None — попробуем при след. reconcile
+                continue
 
-                it["slot_msg_id"] = slot_id
-                it["status_msg_id"] = None
-                _save_queue(batch_id)
             else:
                 if status == "fail":
                     text = f"❌ {full_link}"
@@ -970,7 +983,7 @@ async def reconcile_batch(batch_id: int, force: bool = False):
         )
         _log(f"  📋 очередь (json):  {_queue_snapshot(q)}")
         _log(f"  🧠 состояния (in-memory): {inmem_str}")
-
+        
 async def request_reconcile(batch_id: int, force: bool = False):
     batch = batches.get(batch_id)
     if batch is None:
