@@ -997,6 +997,16 @@ async def request_reconcile(batch_id: int, force: bool = False):
 
         if not state["pending"]:
             break
+# ---------- Хелпер ----------
+def _release_processed(key: tuple, result: str) -> str:
+    """
+    Снимает блокировку processed, если элемент НЕ отложен.
+    'deferred' оставляем в processed — watchdog подхватит.
+    Возвращает result без изменений (удобно для `return _release_processed(...)`).
+    """
+    if result != "deferred":
+        processed.discard(key)
+    return result
 
 # ---------- Обработка одной ссылки ----------
 async def process_link(chat_id, msg_id, full_link, batch_id):
@@ -1011,12 +1021,12 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
 
     st = batch["link_states"].get(key)
     if st is None:
-        processed.discard(key)
+        _release_processed(key, "fail")
         return "fail"
 
     item = _find_item(batch_id, chat_id, msg_id)
     if item is None:
-        processed.discard(key)
+        _release_processed(key, "fail")
         return "fail"
 
     filename = None
@@ -1082,7 +1092,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     )
                     st["status"] = "uploading"
                     await _update_status_msg(batch, key, full_link, force=True)
-                    processed.discard(key)
+                    _release_processed(key, "deferred")
                     # ✅ "deferred" — link_worker НЕ инкрементит счётчик,
                     # batch НЕ закроется, элемент будет обработан при
                     # следующем запуске через resume_pending_queues.
@@ -1121,7 +1131,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
                     if REORDER_AFTER_EACH_FILE:
                         await request_reconcile(batch_id, force=False)
-                    return "ok"
+                    return _release_processed(key, "ok")
                 else:
                     _log(
                         f"📂 {full_link}: в me не найден — "
@@ -1153,7 +1163,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 st["status"] = "fail"
                 _mark_item(batch_id, chat_id, msg_id, status="fail")
                 await _update_status_msg(batch, key, full_link, force=True)
-                processed.discard(key)
+                _release_processed(key, "fail")
                 _log(f"❌ не удалось скачать {full_link}")
                 if REORDER_AFTER_EACH_FILE:
                     await request_reconcile(batch_id, force=False)
@@ -1168,7 +1178,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 st["status"] = "fail"
                 _mark_item(batch_id, chat_id, msg_id, status="fail")
                 await _update_status_msg(batch, key, full_link, force=True)
-                processed.discard(key)
+                _release_processed(key, "fail")
                 try:
                     os.remove(filename)
                 except Exception:
@@ -1261,7 +1271,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
 
         if REORDER_AFTER_EACH_FILE:
             await request_reconcile(batch_id, force=False)
-        return "ok"
+        return _release_processed(key, "ok")
 
     except Exception as e:
         _log(f"❌ {full_link}: {type(e).__name__}: {e}")
@@ -1296,7 +1306,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"для повторной отправки"
                 )
                 await _update_status_msg(batch, key, full_link, force=True)
-                processed.discard(key)
+                _release_processed(key, "deferred")
                 if REORDER_AFTER_EACH_FILE:
                     await request_reconcile(batch_id, force=False)
                 # ✅ "deferred" — НЕ инкрементим fail, batch остаётся
@@ -1319,7 +1329,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             st["status"] = "fail"
 
         await _update_status_msg(batch, key, full_link, force=True)
-        processed.discard(key)
+        _release_processed(key, "fail")
         if REORDER_AFTER_EACH_FILE:
             await request_reconcile(batch_id, force=False)
         return "fail"
@@ -1338,7 +1348,6 @@ async def link_worker(worker_id: int):
             if cancel_flag["cancel"]:
                 result = "skip"
                 _mark_item(batch_id, chat_id, msg_id, status="skip")
-                processed.add((chat_id, msg_id))
                 batch = batches.get(batch_id)
                 if batch is not None:
                     st = batch["link_states"].get((chat_id, msg_id))
@@ -1579,6 +1588,17 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                         _log(
                             f"  🐕 #{batch_id} {it['link']}: "
                             f"уже {cur.get('status')} — пропуск"
+                        )
+                        continue
+
+                    # ✅ Пропуск, если process_link уже работает над элементом.
+                    # send_file для 1 GB идёт минуты, watchdog за это время
+                    # успевает 3 раза инкрементить upload_retries → fail,
+                    # хотя файл успешно отправляется.
+                    if (it["chat_id"], it["msg_id"]) in processed:
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"уже в работе (process_link) — пропуск"
                         )
                         continue
 
@@ -2298,17 +2318,36 @@ async def offer_send_downloaded():
     return failed
 
 # ---------- Отправка «ручных» файлов (не из JSON) ----------
-
-async def upload_manual_file(batch_id: int, item: dict, path: str):
-    """Загружает локальный файл в «Избранное», обновляя статус-сообщение."""
+async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
+    """
+    Загружает локальный файл в «Избранное», обновляя статус-сообщение.
+    Возвращает True при успехе. Бросает исключение при любой ошибке —
+    _run_manual_upload инкрементит b["fail"] только по исключению.
+    """
     chat_id, msg_id = item["chat_id"], item["msg_id"]
     batch = batches.get(batch_id)
     if batch is None:
-        return
+        # ✅ Бросаем, а не return None — иначе _run_manual_upload посчитает ok
+        raise RuntimeError(
+            f"upload_manual_file: batch #{batch_id} не в памяти"
+        )
     key = (chat_id, msg_id)
     st = batch["link_states"].get(key)
     if st is None:
-        return
+        # ✅ Бросаем, а не return None — иначе _run_manual_upload посчитает ok
+        raise RuntimeError(
+            f"upload_manual_file: link_states[{key}] отсутствует "
+            f"в batch #{batch_id}"
+        )
+
+    # ✅ Защита от гонки: файл могли удалить между сканом и загрузкой.
+    # chat_id/msg_id/st уже определены выше — используем их.
+    if not os.path.exists(path):
+        _log(f"⚠️  manual-файл пропал: {path} → fail")
+        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        st["status"] = "fail"
+        # ✅ Бросаем — _run_manual_upload инкрементит b["fail"]
+        raise FileNotFoundError(path)
 
     full_link = item["link"]  # для ручных — это имя файла
     display_name = os.path.basename(path)
@@ -2369,21 +2408,33 @@ async def upload_manual_file(batch_id: int, item: dict, path: str):
     except Exception as e:
         _log(f"⚠️  не удалось удалить {display_name}: {e}")
 
+    # ✅ Явный успех — _run_manual_upload инкрементит b["ok"]
+    return True
 
 async def _run_manual_upload(batch_id: int, item: dict, path: str):
-    b = None
     key = (item["chat_id"], item["msg_id"])
-    
+
     # ✅ Помечаем как «в работе» для watchdog
     b_init = batches.get(batch_id)
     if b_init is not None:
         b_init.setdefault("_uploading", set()).add(key)
-    
+
     try:
-        await upload_manual_file(batch_id, item, path)
+        # ✅ upload_manual_file возвращает True при успехе,
+        # бросает исключение при любой ошибке.
+        ok = await upload_manual_file(batch_id, item, path)
         b = batches.get(batch_id)
         if b is not None:
-            b["ok"] += 1
+            if ok:
+                b["ok"] += 1
+            else:
+                # Защита: если функция вернула None/False без исключения —
+                # считаем это fail, чтобы счётчики сошлись корректно.
+                _log(
+                    f"⚠️  _run_manual_upload: upload_manual_file вернул "
+                    f"{ok!r} вместо True для {os.path.basename(path)} — fail"
+                )
+                b["fail"] += 1
     except Exception as e:
         _log(f"❌  Файл {os.path.basename(path)}: {type(e).__name__}: {e}")
         _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail")
@@ -2561,6 +2612,20 @@ async def handle_saved_messages(event):
     links = extract_all_links(text)
     if not links:
         return
+
+    # ✅ Дедупликация: одна и та же (chat_id, msg_id) в сообщении
+    # не должна попасть в batch дважды — иначе в reconcile появятся
+    # два элемента с одинаковым key и один status_msg на двоих.
+    seen_keys: set[tuple] = set()
+    unique_links: list[tuple] = []
+    for link in links:
+        lkey = (link[0], link[1])
+        if lkey in seen_keys:
+            _log(f"♻️  дубликат ссылки в сообщении: {link[2]} — пропуск")
+            continue
+        seen_keys.add(lkey)
+        unique_links.append(link)
+    links = unique_links
 
     # Всё создание batch — под локом, чтобы параллельные сообщения
     # не получили одинаковый batch_id и не перемешали порядок сообщений.
