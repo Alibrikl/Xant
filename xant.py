@@ -1119,15 +1119,24 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                         pass
                     status_msg = batch["status_msgs"].pop(key, None)
                     if status_msg is not None:
+                        old_id = status_msg.id
                         try:
                             await status_msg.delete()
-                        except Exception:
-                            pass
-                    # Обнуляем status_msg_id в JSON,
-                    # т.к. сообщение уже удалено (или попытались удалить).
-                    # Делаем это ПОСЛЕ delete(), чтобы не затирать id,
-                    # если delete() упадёт — попробуем при следующем reconcile.
-                    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
+                            _log(
+                                f"🗑  удалён статус загрузки {full_link}: "
+                                f"сообщение id={old_id}"
+                            )
+                        except Exception as e:
+                            _log(
+                                f"⚠️  не удалось удалить статус {full_link} "
+                                f"(id={old_id}): {e}"
+                            )
+                    # ✅ Обнуляем status_msg_id И slot_msg_id (если совпадают).
+                    # Иначе reconcile увидит несуществующий slot_msg_id и решит,
+                    # что слот «уже в чате» — плейсхолдер не создастся, но
+                    # сообщение будет удалено. Для done-элемента это значит,
+                    # что в чате останется только файл без позиционного «якоря».
+                    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
                     if REORDER_AFTER_EACH_FILE:
                         await request_reconcile(batch_id, force=False)
                     return _release_processed(key, "ok")
@@ -1261,13 +1270,17 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"⚠️  не удалось удалить статус {full_link} "
                     f"(id={old_id}): {e}"
                 )
-        # Обнуляем status_msg_id в JSON после удаления
-        _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
+        # ✅ Обнуляем status_msg_id И slot_msg_id — это ОДНО И ТО ЖЕ
+        # сообщение для активных элементов. Если оставить slot_msg_id
+        # указывающим на удалённое сообщение, reconcile решит, что
+        # слот «уже в чате» → плейсхолдер ✅ не создастся → элемент
+        # потеряет позиционный «якорь» в очереди сообщений.
+        _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
 
         if os.path.exists(filename):
             os.remove(filename)
             _log(f"🧹 удалён локальный файл: {os.path.basename(filename)}")
-
+            
         if REORDER_AFTER_EACH_FILE:
             await request_reconcile(batch_id, force=False)
         return _release_processed(key, "ok")
@@ -1443,6 +1456,51 @@ async def _maybe_finish_batch(batch_id: int):
         await request_reconcile(batch_id, force=True)
     except Exception as e:
         _log(f"batch #{batch_id}: ошибка перетусовки: {e}")
+
+    # ✅ Вариант B: удаляем плейсхолдеры ✅ <ссылка> у done-элементов.
+    # Делаем это ПОСЛЕ финального reconcile (иначе он пересоздаст их
+    # заново) и ДО отправки summary. В чате останутся только файлы
+    # в правильном порядке + summary.
+    done_slots: list[int] = []
+    q_fin = queues.get(batch_id)
+    if q_fin is not None:
+        for it in q_fin.get("items", []):
+            if it.get("status") == "done" and it.get("slot_msg_id"):
+                done_slots.append(it["slot_msg_id"])
+                it["slot_msg_id"] = None
+        if done_slots:
+            if not b.get("is_manual"):
+                _save_queue(batch_id)
+
+    if done_slots:
+        try:
+            await client.delete_messages("me", done_slots)
+            _log(
+                f"batch #{batch_id}: удалены плейсхолдеры done: "
+                f"{len(done_slots)} шт."
+            )
+        except FloodWaitError as fwe:
+            _log(
+                f"batch #{batch_id}: FloodWait {fwe.seconds}s "
+                f"при удалении плейсхолдеров done"
+            )
+            await asyncio.sleep(fwe.seconds)
+            try:
+                await client.delete_messages("me", done_slots)
+                _log(
+                    f"batch #{batch_id}: удалены плейсхолдеры done "
+                    f"после FloodWait: {len(done_slots)} шт."
+                )
+            except Exception as e:
+                _log(
+                    f"batch #{batch_id}: не удалось удалить "
+                    f"плейсхолдеры done: {e}"
+                )
+        except Exception as e:
+            _log(
+                f"batch #{batch_id}: не удалось удалить "
+                f"плейсхолдеры done: {e}"
+            )
 
     if not b.get("is_manual") and (b["fail"] > 0 or b["skip"] > 0):
         try:
