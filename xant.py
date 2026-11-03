@@ -1053,6 +1053,10 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             st["total"] = total
             st["percent"] = (current / total) * 100 if total else 0
             st["status"] = "downloading"
+            # ✅ Не перезаписываем терминальные статусы (гонка с watchdog)
+            cur_item = _find_item(batch_id, chat_id, msg_id)
+            if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
+                return
             # Запоминаем local_file в JSON сразу, чтобы при аварии
             # файл в downloads/ считался «нашим недокачанным», а не «ручным»
             path = size_holder.get("path")
@@ -1113,6 +1117,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                         file_message_id=found_id,
                         local_file=None,
                         downloaded_at=None,
+                        upload_retries=0,       # ✅ сброс счётчика
                     )
                     st["status"] = "done"
                     try:
@@ -1127,6 +1132,11 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                             await status_msg.delete()
                         except Exception:
                             pass
+                    # Обнуляем status_msg_id в JSON,
+                    # т.к. сообщение уже удалено (или попытались удалить).
+                    # Делаем это ПОСЛЕ delete(), чтобы не затирать id,
+                    # если delete() упадёт — попробуем при следующем reconcile.
+                    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
                     if REORDER_AFTER_EACH_FILE:
                         await request_reconcile(batch_id, force=False)
                     return "ok"
@@ -1215,6 +1225,10 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 st["up_total"] = total
                 st["up_percent"] = (current / total) * 100 if total else 0
                 st["status"] = "uploading"
+                # ✅ Не перезаписываем терминальные статусы (гонка с watchdog)
+                cur_item = _find_item(batch_id, chat_id, msg_id)
+                if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
+                    return
                 _mark_item(batch_id, chat_id, msg_id, status="uploading")
                 if key in batch["status_msgs"]:
                     await _update_status_msg(batch, key, full_link)
@@ -1231,12 +1245,14 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             f"размер={human_size(file_size)}"
         )
 
+        # ✅ Правка 1: сброс upload_retries при успехе
         _mark_item(
             batch_id, chat_id, msg_id,
             status="done",
             file_message_id=sent_id,
             local_file=None,
             downloaded_at=None,
+            upload_retries=0,
         )
         st["status"] = "done"
 
@@ -1254,6 +1270,8 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"⚠️  не удалось удалить статус {full_link} "
                     f"(id={old_id}): {e}"
                 )
+        # Обнуляем status_msg_id в JSON после удаления
+        _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
 
         if os.path.exists(filename):
             os.remove(filename)
@@ -1509,24 +1527,53 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                 )
                 any_fail = False
                 for it in candidates:
-                    local = it.get("local_file")
+                    # ✅ Пропускаем, если элемент уже терминальный
+                    # (гонка: process_link мог успеть поставить done/fail,
+                    #  пока мы собирали candidates)
+                    cur = _find_item(batch_id, it["chat_id"], it["msg_id"])
+                    if cur is None:
+                        continue
+                    if cur.get("status") in ("done", "fail", "skip"):
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"уже {cur.get('status')} — пропуск"
+                        )
+                        continue
+
+                    local = cur.get("local_file")
                     full_path = os.path.join(DOWNLOAD_DIR, local) if local else None
                     file_exists = bool(full_path and os.path.exists(full_path))
 
                     # ✅ uploading без файла на диске — проверяем в me
-                    if it.get("status") == "uploading" and not file_exists:
+                    if cur.get("status") == "uploading" and not file_exists:
                         if not local:
-                            _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                       status="fail", local_file=None)
+                            # ✅ Защита от бесконечного цикла:
+                            # если upload_retries >= 3 — уже пробовали, пропускаем
+                            if cur.get("upload_retries", 0) >= 3:
+                                _log(
+                                    f"  🐕 #{batch_id} {it['link']}: "
+                                    f"uploading без local_file "
+                                    f"(уже {cur.get('upload_retries')} попыток) — пропуск"
+                                )
+                                continue
+                            _mark_item(
+                                batch_id, it["chat_id"], it["msg_id"],
+                                status="fail", local_file=None,
+                                upload_retries=3,   # ✅ фиксируем, что пробовали
+                            )
                             b["fail"] = b.get("fail", 0) + 1
                             any_fail = True
-                            _log(f"  🐕 #{batch_id} {it['link']}: uploading без local_file → fail")
+                            _log(
+                                f"  🐕 #{batch_id} {it['link']}: "
+                                f"uploading без local_file → fail"
+                            )
                             continue
+
                         _log(f"  🐕 #{batch_id} {it['link']}: uploading без файла — проверяю me")
                         try:
                             found_id = await _find_in_me(
                                 display_name=local,
-                                file_size=it.get("file_size"),
+                                file_size=cur.get("file_size"),
                             )
                         except FloodWaitError:
                             _log(f"  🐕 #{batch_id} {it['link']}: FloodWait — откладываю")
@@ -1536,6 +1583,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                                 batch_id, it["chat_id"], it["msg_id"],
                                 status="done", file_message_id=found_id,
                                 local_file=None,
+                                upload_retries=0,
                             )
                             b["ok"] = b.get("ok", 0) + 1
                             _log(
@@ -1546,6 +1594,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             _mark_item(
                                 batch_id, it["chat_id"], it["msg_id"],
                                 status="fail", local_file=None,
+                                upload_retries=3,   # ✅ фиксируем
                             )
                             b["fail"] = b.get("fail", 0) + 1
                             any_fail = True
@@ -1554,15 +1603,24 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
 
                     # downloaded (или uploading с файлом — считаем как downloaded)
                     if not file_exists:
+                        # ✅ Защита от бесконечного цикла
+                        if cur.get("upload_retries", 0) >= 3:
+                            _log(
+                                f"  🐕 #{batch_id} {it['link']}: "
+                                f"файл пропал (уже {cur.get('upload_retries')} попыток) — пропуск"
+                            )
+                            continue
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                   status="fail", local_file=None)
+                                   status="fail", local_file=None,
+                                   upload_retries=3)
                         b["fail"] = b.get("fail", 0) + 1
                         any_fail = True
                         _log(f"  🐕 #{batch_id} {it['link']}: файл пропал → fail")
                         continue
 
-                    retries = it.get("upload_retries", 0)
+                    retries = cur.get("upload_retries", 0)
                     if retries >= 3:
+                        # ✅ Защита от бесконечного цикла
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
                                    status="fail", local_file=None)
                         b["fail"] = b.get("fail", 0) + 1
@@ -2248,6 +2306,7 @@ async def upload_manual_file(batch_id: int, item: dict, path: str):
         file_message_id=sent_id,
         local_file=None,
         downloaded_at=None,
+        upload_retries=0,
     )
     st["status"] = "done"
 
@@ -2257,6 +2316,8 @@ async def upload_manual_file(batch_id: int, item: dict, path: str):
             await status_msg.delete()
         except Exception as e:
             _log(f"⚠️  не удалось удалить статус файла: {e}")
+    # Обнуляем status_msg_id в JSON после удаления
+    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
 
     try:
         if os.path.exists(path):
@@ -2267,9 +2328,10 @@ async def upload_manual_file(batch_id: int, item: dict, path: str):
 
 
 async def _run_manual_upload(batch_id: int, item: dict, path: str):
-    b = batches.get(batch_id)
+    b = None
     try:
         await upload_manual_file(batch_id, item, path)
+        b = batches.get(batch_id)
         if b is not None:
             b["ok"] += 1
     except Exception as e:
