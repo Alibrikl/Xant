@@ -92,6 +92,8 @@ link_queue = None
 batch_create_lock = None
 upload_lock = None
 shutdown_event = None
+upload_queue = None          # ✅ очередь на отправку (по порядку)
+upload_worker_task = None    # ✅ фоновый воркер отправки
 
 _pending_deletions: set[asyncio.Task] = set()
 
@@ -845,58 +847,18 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             tag = f"item #{idx} {full_link} ({status})"
 
             if status == "done" and it.get("file_message_id"):
-                # ✅ Слот уже есть в чате — НЕ пересоздаём.
-                # Иначе forward_messages создаст копию file_message_id,
-                # а оригинал останется → дубликаты.
-                if it.get("slot_msg_id"):
-                    _log(
-                        f"  ⏭  ПРОПУСК пересылки {tag}: "
-                        f"слот {it['slot_msg_id']} уже в чате"
-                    )
-                    continue
-
-                # Слот отсутствует (был удалён вручную или при краше).
-                # Оригинал file_message_id НЕ трогаем — он уже в чате.
-                # Создаём текстовый плейсхолдер как слот (без forward),
-                # чтобы slot_msg_id указывал на реально существующее
-                # сообщение и следующая перетусовка не сломалась.
-                try:
-                    msg = await client.send_message("me", f"✅ {full_link}")
-                    it["slot_msg_id"] = msg.id
-                    it["status_msg_id"] = None
-                    _save_queue(batch_id)
-                    _log(
-                        f"  ✅ {tag}: создан плейсхолдер {msg.id} "
-                        f"(оригинал {it['file_message_id']} не тронут)"
-                    )
-                except FloodWaitError as fwe:
-                    _log(
-                        f"  ⏳ FloodWait {fwe.seconds}s при создании "
-                        f"плейсхолдера {tag}"
-                    )
-                    await asyncio.sleep(fwe.seconds)
-                    try:
-                        msg = await client.send_message(
-                            "me", f"✅ {full_link}"
-                        )
-                        it["slot_msg_id"] = msg.id
-                        it["status_msg_id"] = None
-                        _save_queue(batch_id)
-                        _log(
-                            f"  ✅ {tag}: создан плейсхолдер {msg.id} "
-                            f"(после FloodWait)"
-                        )
-                    except Exception as e:
-                        _log(
-                            f"  ⚠️  {tag}: не удалось создать "
-                            f"плейсхолдер: {e}"
-                        )
-                except Exception as e:
-                    _log(
-                        f"  ⚠️  {tag}: не удалось создать "
-                        f"плейсхолдер: {e}"
-                    )
-                # slot_msg_id останется None — попробуем при след. reconcile
+                # ✅ Плейсхолдер ✅ <ссылка> НЕ создаём вообще.
+                # Файл (file_message_id) уже в чате с caption — это
+                # самодостаточное сообщение. Двигать его reconcile не
+                # может (не с чем работать), но это осознанный компромисс:
+                # без плейсхолдера в чате нет визуального мусора.
+                # Порядок done-элементов зафиксирован в момент отправки,
+                # reconcile его не перетусовывает.
+                _log(
+                    f"  ⏭  ПРОПУСК пересылки {tag}: "
+                    f"файл id={it['file_message_id']} уже в чате "
+                    f"(плейсхолдер не создаём)"
+                )
                 continue
 
             else:
@@ -1212,7 +1174,11 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             _log(f"⬇️  скачан {full_link} → {local_name}")
             await _update_status_msg(batch, key, full_link, force=True)
 
-        # ---------- Отправка в me ----------
+        # ---------- Скачивание завершено — ставим в очередь на отправку ----------
+        # ✅ Отправка вынесена в отдельный upload-воркер (_upload_worker),
+        # который идёт по порядку q["items"]. Это гарантирует:
+        #   • скачивание — параллельно (3 воркера link_queue);
+        #   • отправка  — строго по одной, в порядке ссылок в batch.
         display_name = os.path.basename(filename)
         file_size = size_holder.get("size") or (
             os.path.getsize(filename) if os.path.exists(filename) else 0
@@ -1222,78 +1188,26 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         st["up_percent"] = 0.0
         st["last_up_cb"] = 0.0
 
-        async def upload_cb(current, total):
-            now = time.time()
-            if now - st.get("last_up_cb", 0) > 3 or current == total:
-                st["last_up_cb"] = now
-                st["up_current"] = current
-                st["up_total"] = total
-                st["up_percent"] = (current / total) * 100 if total else 0
-                st["status"] = "uploading"
-                # ✅ Не перезаписываем терминальные статусы (гонка с watchdog)
-                cur_item = _find_item(batch_id, chat_id, msg_id)
-                if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
-                    return
-                _mark_item(batch_id, chat_id, msg_id, status="uploading")
-                if key in batch["status_msgs"]:
-                    await _update_status_msg(batch, key, full_link)
-
-        # ✅ Caption — только для видео (для аудио/документов — без подписи)
-        caption = None
-        if _get_send_kind(filename) == "video":
-            caption = f"🎬 {display_name}"
-
-        async with upload_lock:
-            sent = await _send_media("me", filename, display_name, upload_cb, caption=caption)
-            
-        sent_msg = sent[0] if isinstance(sent, list) else sent
-        sent_id = getattr(sent_msg, "id", None)
-
-        _log(
-            f"✅ файл загружен в «Избранное»: {full_link} "
-            f"→ сообщение id={sent_id}, "
-            f"размер={human_size(file_size)}"
-        )
-
-        # ✅ Правка 1: сброс upload_retries при успехе
+        # ✅ Статус остаётся "downloaded" — upload-воркер подхватит
+        # и переведёт в "uploading" → "done".
         _mark_item(
             batch_id, chat_id, msg_id,
-            status="done",
-            file_message_id=sent_id,
-            local_file=None,
-            downloaded_at=None,
-            upload_retries=0,
+            status="downloaded",
+            local_file=display_name,
+            downloaded_at=time.time(),
+            file_size=file_size,
         )
-        st["status"] = "done"
+        await _update_status_msg(batch, key, full_link, force=True)
 
-        status_msg = batch["status_msgs"].pop(key, None)
-        if status_msg is not None:
-            old_id = status_msg.id
-            try:
-                await status_msg.delete()
-                _log(
-                    f"🗑  удалён статус загрузки {full_link}: "
-                    f"сообщение id={old_id}"
-                )
-            except Exception as e:
-                _log(
-                    f"⚠️  не удалось удалить статус {full_link} "
-                    f"(id={old_id}): {e}"
-                )
-        # ✅ Обнуляем status_msg_id И slot_msg_id — это ОДНО И ТО ЖЕ
-        # сообщение для активных элементов. Если оставить slot_msg_id
-        # указывающим на удалённое сообщение, reconcile решит, что
-        # слот «уже в чате» → плейсхолдер ✅ не создастся → элемент
-        # потеряет позиционный «якорь» в очереди сообщений.
-        _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
+        _log(
+            f"📥 скачан и поставлен в очередь на отправку: {full_link} "
+            f"→ {display_name} ({human_size(file_size)})"
+        )
 
-        if os.path.exists(filename):
-            os.remove(filename)
-            _log(f"🧹 удалён локальный файл: {os.path.basename(filename)}")
-            
-        if REORDER_AFTER_EACH_FILE:
-            await request_reconcile(batch_id, force=False)
-        return _release_processed(key, "ok")
+        # ✅ Возвращаем "downloaded" — link_worker НЕ инкрементит счётчики.
+        # Реальный "ok"/"fail" инкрементит upload-воркер после отправки.
+        _release_processed(key, "downloaded")
+        return "downloaded"
 
     except Exception as e:
         _log(f"❌ {full_link}: {type(e).__name__}: {e}")
@@ -1391,7 +1305,17 @@ async def link_worker(worker_id: int):
                         f"worker #{worker_id}: {full_link} — отложено "
                         f"(не инкременчу счётчики)"
                     )
+                elif result == "downloaded":
+                    # ✅ Скачано, но НЕ отправлено — upload-воркер подхватит.
+                    # Счётчики не инкрементим (ok/fail будут после отправки).
+                    _log(
+                        f"worker #{worker_id}: {full_link} — скачано, "
+                        f"ждёт отправки (upload-воркер)"
+                    )
                 else:
+                    # result == "ok" / "fail" / "skip" — от process_link
+                    # (skip при cancel). Для "ok" теперь этого не бывает —
+                    # отправка в upload-воркере. Оставляем на всякий случай.
                     batch[result] += 1
                     _log(
                         f"worker #{worker_id}: {result} | "
@@ -1467,51 +1391,6 @@ async def _maybe_finish_batch(batch_id: int):
     except Exception as e:
         _log(f"batch #{batch_id}: ошибка перетусовки: {e}")
 
-    # ✅ Вариант B: удаляем плейсхолдеры ✅ <ссылка> у done-элементов.
-    # Делаем это ПОСЛЕ финального reconcile (иначе он пересоздаст их
-    # заново) и ДО отправки summary. В чате останутся только файлы
-    # в правильном порядке + summary.
-    done_slots: list[int] = []
-    q_fin = queues.get(batch_id)
-    if q_fin is not None:
-        for it in q_fin.get("items", []):
-            if it.get("status") == "done" and it.get("slot_msg_id"):
-                done_slots.append(it["slot_msg_id"])
-                it["slot_msg_id"] = None
-        if done_slots:
-            if not b.get("is_manual"):
-                _save_queue(batch_id)
-
-    if done_slots:
-        try:
-            await client.delete_messages("me", done_slots)
-            _log(
-                f"batch #{batch_id}: удалены плейсхолдеры done: "
-                f"{len(done_slots)} шт."
-            )
-        except FloodWaitError as fwe:
-            _log(
-                f"batch #{batch_id}: FloodWait {fwe.seconds}s "
-                f"при удалении плейсхолдеров done"
-            )
-            await asyncio.sleep(fwe.seconds)
-            try:
-                await client.delete_messages("me", done_slots)
-                _log(
-                    f"batch #{batch_id}: удалены плейсхолдеры done "
-                    f"после FloodWait: {len(done_slots)} шт."
-                )
-            except Exception as e:
-                _log(
-                    f"batch #{batch_id}: не удалось удалить "
-                    f"плейсхолдеры done: {e}"
-                )
-        except Exception as e:
-            _log(
-                f"batch #{batch_id}: не удалось удалить "
-                f"плейсхолдеры done: {e}"
-            )
-
     if not b.get("is_manual") and (b["fail"] > 0 or b["skip"] > 0):
         try:
             summary_msg = await b["event"].respond(
@@ -1538,6 +1417,300 @@ async def _maybe_finish_batch(batch_id: int):
             pass
 
     _log(f"batch #{batch_id}: пачка закрыта и удалена из памяти")
+
+# ---------- Upload worker: отправка строго по порядку ----------
+async def _upload_worker():
+    """
+    Отправляет элементы в «Избранное» СТРОГО по порядку q["items"].
+
+    Логика (строгий порядок):
+      • раз в UPLOAD_POLL_INTERVAL секунд проходит по всем активным batches;
+      • в каждом batch идёт по items слева направо;
+      • первый НЕ-терминальный элемент (pending/downloading/downloaded/uploading):
+          - если downloaded + файл существует → отправляет его;
+          - если pending/downloading/uploading → ЖДЁТ (не перескакивает),
+            пока он не станет done/fail/skip или downloaded;
+      • после успешной отправки идёт к следующему batch.
+    """
+    UPLOAD_POLL_INTERVAL = 2.0
+
+    while True:
+        try:
+            await asyncio.sleep(UPLOAD_POLL_INTERVAL)
+
+            for batch_id, b in list(batches.items()):
+                q = queues.get(batch_id)
+                if q is None:
+                    continue
+
+                # Для manual-батчей — отдельная логика (_run_manual_upload),
+                # их upload-воркер не трогает.
+                if b.get("is_manual"):
+                    continue
+
+                # ✅ Строгий порядок: идём по items слева направо.
+                # Берём ПЕРВЫЙ не-терминальный элемент. Если он ещё
+                # не downloaded — ЖДЁМ (break), не перескакиваем.
+              
+                target = None
+                wait_for = None
+                failed_missing = False
+                for it in q.get("items", []):
+                    status = it.get("status")
+                    if status in ("done", "fail", "skip"):
+                        continue  # уже терминальный — пропускаем
+                    # Первый не-терминальный элемент — наш «барьер».
+                    key = (it["chat_id"], it["msg_id"])
+                    if key in processed:
+                        # Элемент ещё в работе у process_link (скачивается)
+                        wait_for = (it, "processing")
+                        break
+                    if key in b.get("_uploading", set()):
+                        # Уже отправляется этим же воркером
+                        wait_for = (it, "uploading")
+                        break
+                    if status == "downloaded":
+                        lf = it.get("local_file")
+                        if not lf:
+                            # ✅ Нет local_file — сразу fail, не ждём watchdog.
+                            _mark_item(batch_id, it["chat_id"], it["msg_id"],
+                                       status="fail", local_file=None)
+                            b["fail"] = b.get("fail", 0) + 1
+                            failed_missing = True
+                            _log(
+                                f"  ❌ upload-воркер: {it['link']}: "
+                                f"local_file=None → fail"
+                            )
+                            break
+                        full_path = os.path.join(DOWNLOAD_DIR, lf)
+                        if not os.path.exists(full_path):
+                            # ✅ Файла нет — сразу fail, не ждём watchdog.
+                            _mark_item(batch_id, it["chat_id"], it["msg_id"],
+                                       status="fail", local_file=None)
+                            b["fail"] = b.get("fail", 0) + 1
+                            failed_missing = True
+                            _log(
+                                f"  ❌ upload-воркер: {it['link']}: "
+                                f"файл пропал ({full_path}) → fail"
+                            )
+                            break
+                        # ✅ Готов к отправке — берём.
+                        target = it
+                        break
+                    else:
+                        # pending / downloading / uploading — ЖДЁМ.
+                        wait_for = (it, status)
+                        break
+
+                if failed_missing:
+                    # ✅ Пометили fail — пересмотрим batch на след. цикле
+                    # (возможно, следующий элемент уже downloaded).
+                    await _maybe_finish_batch(batch_id)
+                    continue
+                
+                if wait_for is not None:
+                    # Есть барьер — логируем раз в N секунд (не спамим).
+                    wkey = (wait_for[0]["chat_id"], wait_for[0]["msg_id"])
+                    wstate = b.setdefault("_upload_wait_state", {})
+                    if wstate.get("key") != wkey or \
+                       wstate.get("status") != wait_for[1]:
+                        wstate["key"] = wkey
+                        wstate["status"] = wait_for[1]
+                        wstate["ts"] = time.time()
+                        _log(
+                            f"⏳ upload-воркер: batch #{batch_id} ждёт "
+                            f"{wait_for[0]['link']} "
+                            f"({wait_for[1]}) — не перескакиваем"
+                        )
+                    continue
+
+                if target is None:
+                    # Все элементы в терминальных статусах — нечего делать.
+                    # Сбрасываем ожидание.
+                    b.pop("_upload_wait_state", None)
+                    continue
+
+                # ✅ Сбрасываем ожидание — сейчас начнём отправлять.
+                b.pop("_upload_wait_state", None)
+
+                key = (target["chat_id"], target["msg_id"])
+                b.setdefault("_uploading", set()).add(key)
+                try:
+                    result = await _upload_one(batch_id, b, target)
+                    if result == "ok":
+                        b["ok"] = b.get("ok", 0) + 1
+                        _log(
+                            f"📤 upload-воркер: {target['link']} → ok | "
+                            f"batch #{batch_id}: ok={b['ok']}, "
+                            f"skip={b['skip']}, fail={b['fail']}, "
+                            f"total={b['total']}"
+                        )
+                        await _maybe_finish_batch(batch_id)
+                    elif result == "fail":
+                        b["fail"] = b.get("fail", 0) + 1
+                        _log(
+                            f"❌ upload-воркер: {target['link']} → fail | "
+                            f"batch #{batch_id}: ok={b['ok']}, "
+                            f"skip={b['skip']}, fail={b['fail']}, "
+                            f"total={b['total']}"
+                        )
+                        await _maybe_finish_batch(batch_id)
+                    elif result == "deferred":
+                        # Оставляем "downloaded", на следующем цикле
+                        # попробуем снова (этот же элемент).
+                        _log(
+                            f"⏳ upload-воркер: {target['link']} — отложено "
+                            f"(следующий цикл)"
+                        )
+                finally:
+                    b.get("_uploading", set()).discard(key)
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            _log(f"upload-воркер: ошибка: {type(e).__name__}: {e}")
+
+
+async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
+    """
+    Отправляет ОДИН downloaded-элемент в «Избранное».
+    Возвращает:
+      • "ok"       — успешно отправлен, статус done;
+      • "fail"     — ошибка, статус fail;
+      • "deferred" — временная ошибка, оставить downloaded и попробовать позже.
+    """
+    chat_id = it["chat_id"]
+    msg_id = it["msg_id"]
+    full_link = it["link"]
+    local_name = it.get("local_file")
+    if not local_name:
+        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        return "fail"
+
+    filename = os.path.join(DOWNLOAD_DIR, local_name)
+    if not os.path.exists(filename):
+        _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None)
+        _log(f"❌ upload-воркер: {full_link}: файл пропал ({filename}) → fail")
+        return "fail"
+
+    key = (chat_id, msg_id)
+    st = batch["link_states"].get(key)
+    if st is None:
+        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        return "fail"
+
+    display_name = os.path.basename(filename)
+    file_size = it.get("file_size") or os.path.getsize(filename)
+
+    st["status"] = "uploading"
+    st["up_current"] = 0
+    st["up_total"] = file_size
+    st["up_percent"] = 0.0
+    st["last_up_cb"] = 0.0
+    _mark_item(batch_id, chat_id, msg_id, status="uploading")
+    await _update_status_msg(batch, key, full_link, force=True)
+
+    async def upload_cb(current, total):
+        now = time.time()
+        if now - st.get("last_up_cb", 0) > 3 or current == total:
+            st["last_up_cb"] = now
+            st["up_current"] = current
+            st["up_total"] = total
+            st["up_percent"] = (current / total) * 100 if total else 0
+            cur_item = _find_item(batch_id, chat_id, msg_id)
+            if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
+                return
+            _mark_item(batch_id, chat_id, msg_id, status="uploading")
+            if key in batch["status_msgs"]:
+                await _update_status_msg(batch, key, full_link)
+
+    # ✅ Caption — только для видео
+    caption = None
+    if _get_send_kind(filename) == "video":
+        caption = f"🎬 {display_name}"
+
+    try:
+        async with upload_lock:
+            sent = await _send_media(
+                "me", filename, display_name, upload_cb, caption=caption
+            )
+    except FloodWaitError as fwe:
+        _log(
+            f"⏳ upload-воркер: {full_link}: FloodWait {fwe.seconds}s "
+            f"— откладываю"
+        )
+        # Возвращаем "downloaded", чтобы попробовать позже.
+        _mark_item(batch_id, chat_id, msg_id, status="downloaded")
+        st["status"] = "downloaded"
+        await _update_status_msg(batch, key, full_link, force=True)
+        return "deferred"
+    except Exception as e:
+        _log(f"❌ upload-воркер: {full_link}: {type(e).__name__}: {e}")
+        # Проверим, не целый ли файл (та же логика, что была в process_link).
+        try:
+            actual = os.path.getsize(filename)
+        except Exception:
+            actual = 0
+        if file_size > 0 and actual >= file_size:
+            _log(
+                f"♻️  upload-воркер: {full_link}: файл целый "
+                f"({human_size(actual)}) — оставляю downloaded, повтор позже"
+            )
+            _mark_item(batch_id, chat_id, msg_id, status="downloaded")
+            st["status"] = "downloaded"
+            await _update_status_msg(batch, key, full_link, force=True)
+            return "deferred"
+        else:
+            _cleanup_partial(filename, file_size)
+            _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None)
+            st["status"] = "fail"
+            await _update_status_msg(batch, key, full_link, force=True)
+            return "fail"
+
+    sent_msg = sent[0] if isinstance(sent, list) else sent
+    sent_id = getattr(sent_msg, "id", None)
+
+    _log(
+        f"✅ upload-воркер: файл загружен в «Избранное»: {full_link} "
+        f"→ сообщение id={sent_id}, размер={human_size(file_size)}"
+    )
+
+    _mark_item(
+        batch_id, chat_id, msg_id,
+        status="done",
+        file_message_id=sent_id,
+        local_file=None,
+        downloaded_at=None,
+        upload_retries=0,
+    )
+    st["status"] = "done"
+
+    status_msg = batch["status_msgs"].pop(key, None)
+    if status_msg is not None:
+        old_id = status_msg.id
+        try:
+            await status_msg.delete()
+            _log(
+                f"🗑  удалён статус загрузки {full_link}: "
+                f"сообщение id={old_id}"
+            )
+        except Exception as e:
+            _log(
+                f"⚠️  не удалось удалить статус {full_link} "
+                f"(id={old_id}): {e}"
+            )
+    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
+
+    if os.path.exists(filename):
+        try:
+            os.remove(filename)
+            _log(f"🧹 удалён локальный файл: {os.path.basename(filename)}")
+        except Exception as e:
+            _log(f"⚠️  не удалось удалить {os.path.basename(filename)}: {e}")
+
+    if REORDER_AFTER_EACH_FILE:
+        await request_reconcile(batch_id, force=False)
+    return "ok"
 
 # ---------- Watchdog зависших batch ----------
 async def _watchdog_stuck_batches(interval: float = 60.0):
@@ -2821,6 +2994,7 @@ def _print_scan_summary(scan: dict):
 # ---------- Запуск ----------
 async def main():
     global link_queue, batch_create_lock, shutdown_event, upload_lock
+    global upload_queue, upload_worker_task
     link_queue = asyncio.Queue()
     batch_create_lock = asyncio.Lock()
     shutdown_event = asyncio.Event()
@@ -2912,7 +3086,11 @@ async def main():
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
     ]
-    print(f"  ▶ Запущено воркеров: {CONCURRENT_DOWNLOADS}")
+    print(f"  ▶ Запущено воркеров скачивания: {CONCURRENT_DOWNLOADS}")
+
+    # ✅ Отдельный воркер отправки — строго по одному, по порядку items.
+    upload_worker_task = asyncio.create_task(_upload_worker())
+    print("  📤 Запущен upload-воркер (по одному, по порядку)")
 
     watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
     print("  🐕 Запущен watchdog зависших пачек")
@@ -2992,10 +3170,15 @@ async def main():
         print("🛑 Завершение работы...")
     finally:
         watchdog_task.cancel()
+        if upload_worker_task is not None:
+            upload_worker_task.cancel()
         for w in workers:
             w.cancel()
         await asyncio.gather(
-            watchdog_task, *workers, return_exceptions=True
+            watchdog_task,
+            *( [upload_worker_task] if upload_worker_task else [] ),
+            *workers,
+            return_exceptions=True,
         )
         if _pending_deletions:
             await asyncio.gather(*_pending_deletions, return_exceptions=True)
