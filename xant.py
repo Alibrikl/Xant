@@ -995,6 +995,18 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         _release_processed(key, "fail")
         return "fail"
 
+    # ✅ ГЛАВНАЯ ЗАЩИТА ОТ ДУБЛИКАТОВ:
+    # если элемент уже done/skip/fail — НЕ скачиваем повторно.
+    # Это спасает от гонки: watchdog поставил в link_queue,
+    # а _upload_worker уже отправил и пометил done.
+    if item.get("status") in ("done", "skip", "fail"):
+        _log(
+            f"⏭  пропуск {full_link}: уже {item.get('status')} "
+            f"(повторный process_link)"
+        )
+        _release_processed(key, "skip")
+        return "skip"
+
     filename = None
     size_holder = {"size": 0}
 
@@ -1932,6 +1944,44 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             f"превышено попыток ({retries}) → fail"
                         )
                         continue
+
+                    # ✅ ПРАВКА 2: ещё раз проверяем статус прямо перед
+                    # link_queue.put. Пока мы собирали candidates и
+                    # дошли до этого места, _upload_worker мог успеть
+                    # отправить элемент и пометить done. Если статус
+                    # изменился на терминальный/uploading — не ставим
+                    # в очередь (иначе process_link перекачает заново
+                    # и создаст дубликат в downloads/).
+                    cur2 = _find_item(batch_id, it["chat_id"], it["msg_id"])
+                    if cur2 is None:
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"элемент исчез из JSON — пропуск"
+                        )
+                        continue
+                    if cur2.get("status") in ("done", "fail", "skip", "uploading"):
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"статус изменился на «{cur2.get('status')}» — "
+                            f"не ставим в link_queue (пропуск)"
+                        )
+                        continue
+                    # ✅ Дополнительно: если элемент уже кто-то обрабатывает
+                    # (process_link) или он уже в нашем _uploading —
+                    # тоже пропускаем.
+                    if (it["chat_id"], it["msg_id"]) in processed:
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"уже в processed — пропуск"
+                        )
+                        continue
+                    if (it["chat_id"], it["msg_id"]) in b.get("_uploading", set()):
+                        _log(
+                            f"  🐕 #{batch_id} {it['link']}: "
+                            f"уже в _uploading — пропуск"
+                        )
+                        continue
+
                     _mark_item(batch_id, it["chat_id"], it["msg_id"],
                                status="downloaded",
                                upload_retries=retries + 1)
@@ -1946,6 +1996,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                         )
                     except Exception as e:
                         _log(f"  ❌ #{batch_id} {it['link']}: {e}")
+
                 if any_fail:
                     await _maybe_finish_batch(batch_id)
                 wd["key"] = None
