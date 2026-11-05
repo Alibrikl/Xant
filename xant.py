@@ -1202,10 +1202,11 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                              f"{os.path.basename(filename)}")
                     except Exception:
                         pass
-                    # 1) Сначала обнуляем id в JSON.
-                    _mark_item(batch_id, chat_id, msg_id,
-                               status_msg_id=None, slot_msg_id=None)
-                    # 2) Потом удаляем старое сообщение.
+                    # ✅ Сначала УДАЛЯЕМ сообщение, потом обнуляем id в JSON.
+                    # Если delete() упадёт — status_msg_id останется,
+                    # следующий reconcile попробует удалить снова.
+                    # Обратный порядок (mark → delete) оставляет «сироту»:
+                    # в JSON None, а сообщение в чате висит.
                     status_msg = batch["status_msgs"].pop(key, None)
                     if status_msg is not None:
                         old_id = status_msg.id
@@ -1215,11 +1216,22 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                                 f"🗑  удалён статус загрузки {full_link}: "
                                 f"сообщение id={old_id}"
                             )
+                            # ✅ id обнуляем ТОЛЬКО после успешного delete.
+                            _mark_item(batch_id, chat_id, msg_id,
+                                       status_msg_id=None, slot_msg_id=None)
                         except Exception as e:
                             _log(
                                 f"⚠️  не удалось удалить статус {full_link} "
-                                f"(id={old_id}): {e}"
+                                f"(id={old_id}): {e} — status_msg_id "
+                                f"оставляем, reconcile повторит"
                             )
+                            # ❗ status_msg_id НЕ обнуляем — пусть reconcile
+                            # попробует удалить снова.
+                    else:
+                        # status_msg уже нет в in-memory (кто-то удалил
+                        # раньше) — на всякий случай обнуляем id в JSON.
+                        _mark_item(batch_id, chat_id, msg_id,
+                                   status_msg_id=None, slot_msg_id=None)
                     if REORDER_AFTER_EACH_FILE:
                         await request_reconcile(batch_id, force=False)
                     return _release_processed(key, "ok")
@@ -1815,10 +1827,11 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     )
     st["status"] = "done"
 
-    # 1) Сначала обнуляем id в JSON — чтобы reconcile, если и создаст
-    #    новое сообщение, не был затёрт последующим _mark_item.
-    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
-    # 2) Теперь безопасно удаляем старое сообщение.
+    # ✅ Сначала УДАЛЯЕМ сообщение, потом обнуляем id в JSON.
+    # Если delete() упадёт — status_msg_id останется,
+    # следующий reconcile попробует удалить снова.
+    # Обратный порядок (mark → delete) оставляет «сироту»:
+    # в JSON None, а сообщение в чате висит.
     status_msg = batch["status_msgs"].pop(key, None)
     if status_msg is not None:
         old_id = status_msg.id
@@ -1828,11 +1841,21 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
                 f"🗑  удалён статус загрузки {full_link}: "
                 f"сообщение id={old_id}"
             )
+            # ✅ id обнуляем ТОЛЬКО после успешного delete.
+            _mark_item(batch_id, chat_id, msg_id,
+                       status_msg_id=None, slot_msg_id=None)
         except Exception as e:
             _log(
                 f"⚠️  не удалось удалить статус {full_link} "
-                f"(id={old_id}): {e}"
+                f"(id={old_id}): {e} — status_msg_id оставляем, "
+                f"reconcile повторит"
             )
+            # ❗ status_msg_id НЕ обнуляем — пусть reconcile попробует снова.
+    else:
+        # status_msg уже нет в in-memory (кто-то удалил раньше) —
+        # на всякий случай обнуляем id в JSON.
+        _mark_item(batch_id, chat_id, msg_id,
+                   status_msg_id=None, slot_msg_id=None)
 
     if os.path.exists(filename):
         try:
@@ -1923,6 +1946,21 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                     mwd["key"] = None
                     continue
 
+                # ✅ ГЛАВНАЯ ЗАЩИТА: если upload-воркер активен
+                # (в _uploading есть элементы) — downloaded не «зависли»,
+                # они в очереди upload-воркера. Не трогаем batch вообще.
+                # Без этого watchdog за 3 цикла (180 сек) пометит
+                # downloaded → fail, даже если upload-воркер ещё
+                # отправляет более ранние (77 файлов × 30 сек = 40 мин).
+                if b.get("_uploading"):
+                    _log(
+                        f"🐕 watchdog: batch #{batch_id} — "
+                        f"upload-воркер активен "
+                        f"({len(b.get('_uploading'))} эл.), "
+                        f"downloaded ждут очереди — пропускаем"
+                    )
+                    continue
+
                 # downloaded — безопасно переотправить
                 # uploading — сначала проверим в me, вдруг уже улетело
                 candidates = [
@@ -1931,6 +1969,58 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                 ]
                 if not candidates:
                     continue
+
+                # ✅ ГЛАВНАЯ ЗАЩИТА: не трогаем downloaded-элементы,
+                # если upload-воркер ещё НЕ ДОШЁЛ до них (перед ними
+                # по порядку items есть не-терминальный элемент:
+                # pending/downloading/uploading/processing).
+                # upload-воркер СТРОГО идёт по порядку — эти downloaded
+                # не «зависли», а стоят в очереди. Иначе watchdog
+                # через 3 цикла (180 сек) пометит их fail, хотя они
+                # просто ждут (например, batch из 77 файлов:
+                # 31252 → fail, 31373 downloaded, но upload-воркер
+                # ещё отправляет 31250 — watchdog пометит 31373 fail).
+                items_all = q.get("items", [])
+                candidate_indices = []
+                for cand in candidates:
+                    for i, it in enumerate(items_all):
+                        if (it["chat_id"] == cand["chat_id"]
+                                and it["msg_id"] == cand["msg_id"]):
+                            candidate_indices.append(i)
+                            break
+
+                if candidate_indices:
+                    first_cand_idx = min(candidate_indices)
+                    blockers = [
+                        items_all[i] for i in range(first_cand_idx)
+                        if items_all[i].get("status") in (
+                            "pending", "downloading", "uploading"
+                        )
+                    ]
+                    proc_blockers = [
+                        items_all[i] for i in range(first_cand_idx)
+                        if (items_all[i]["chat_id"],
+                            items_all[i]["msg_id"]) in processed
+                    ]
+                    if blockers or proc_blockers:
+                        block_info = blockers + proc_blockers
+                        b_block = tuple(
+                            (x["chat_id"], x["msg_id"]) for x in block_info
+                        )
+                        wd_block = b.setdefault("_wd_block", {})
+                        if wd_block.get("key") != b_block:
+                            wd_block["key"] = b_block
+                            wd_block["ts"] = now
+                            _log(
+                                f"🐕 watchdog: batch #{batch_id} — "
+                                f"есть барьер перед downloaded "
+                                f"({len(block_info)} эл. в pending/downloading/"
+                                f"uploading/processing) — не трогаем "
+                                f"downloaded (ждут строгого порядка)"
+                            )
+                        continue
+
+                b.pop("_wd_block", None)
 
                 # ✅ СТРОГИЙ ПОРЯДОК: не трогаем downloaded/uploading,
                 # если перед ними по порядку есть не-терминальный
@@ -2889,15 +2979,19 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     )
     st["status"] = "done"
 
-    # 1) Сначала обнуляем id в JSON.
-    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
-    # 2) Потом удаляем старое сообщение.
+    # ✅ Сначала УДАЛЯЕМ сообщение, потом обнуляем id в JSON —
+    # консистентно с process_link и _upload_one.
     status_msg = batch["status_msgs"].pop(key, None)
     if status_msg is not None:
         try:
             await status_msg.delete()
+            _mark_item(batch_id, chat_id, msg_id,
+                       status_msg_id=None, slot_msg_id=None)
         except Exception as e:
             _log(f"⚠️  не удалось удалить статус файла: {e}")
+    else:
+        _mark_item(batch_id, chat_id, msg_id,
+                   status_msg_id=None, slot_msg_id=None)
 
     try:
         if os.path.exists(path):
