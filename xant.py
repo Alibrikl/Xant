@@ -3103,7 +3103,7 @@ async def handle_saved_messages(event):
     # ---------- /quit ----------
     if cmd in ("/quit", "/exit", "/shutdown"):
         await event.respond(
-            "🛑 Останавливаюсь. Текущие загрузки завершатся, затем выход."
+            "🛑 Работа прекращена."
         )
         shutdown_event.set()
         return
