@@ -12,6 +12,7 @@ from telethon.errors import (
     FileReferenceExpiredError,
     FloodWaitError,
     MessageNotModifiedError,
+    ChannelPrivateError,
 )
 from telethon.tl import types
 from telethon.tl.types import (
@@ -96,6 +97,7 @@ upload_queue = None          # ✅ очередь на отправку (по п
 upload_worker_task = None    # ✅ фоновый воркер отправки
 
 _pending_deletions: set[asyncio.Task] = set()
+_pending_manual_uploads: set[asyncio.Task] = set()
 
 # ---------- Отложенное удаление ----------
 async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
@@ -320,21 +322,39 @@ async def _find_in_me(display_name: str, file_size: int | None,
         return None
 
     cache_key = (display_name, file_size if file_size and file_size > 0 else None)
+    check_size = bool(file_size and file_size > 0)
 
-    # 1) Проверяем кэш — только успешные находки
+    # 1) Проверяем кэш — только успешные находки.
+    # ✅ При ЛЮБОЙ ошибке проверки (сеть, FloodWait, сообщение удалено,
+    # имя/размер не совпали) — убираем запись из кэша и идём
+    # сканировать заново. НЕ возвращаем cached «на веру»: иначе
+    # сетевой сбой в момент проверки даст ложный done, и файл
+    # не будет отправлен повторно.
     cached = _find_cache.get(cache_key)
     if cached is not None:
         try:
             m = await client.get_messages("me", ids=cached)
-            if m is None:
-                _find_cache.pop(cache_key, None)
-            else:
-                _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
+            matched = (
+                m is not None
+                and m.file is not None
+                and m.file.name == display_name
+                and (
+                    not check_size
+                    or (getattr(m.file, "size", 0) or 0) == file_size
+                )
+            )
+            if matched:
+                _log(
+                    f"  💾 _find_in_me({display_name}): из кэша (id={cached})"
+                )
                 return cached
+            # Не совпало (сообщение удалено, имя/размер другие) —
+            # убираем из кэша.
+            _find_cache.pop(cache_key, None)
         except Exception:
-            return cached
+            # Ошибка проверки — не доверяем кэшу, идём сканировать.
+            _find_cache.pop(cache_key, None)
 
-    check_size = bool(file_size and file_size > 0)
     attempt = 0
     while True:
         try:
@@ -431,9 +451,15 @@ def _scan_downloads() -> dict:
     manual: list[str] = []
     own_partial: list[tuple[int, dict, str]] = []
     own_ready: list[tuple[int, dict, str]] = []
+    anomalous_done: list[tuple[int, dict, str]] = []
 
     if not os.path.isdir(DOWNLOAD_DIR):
-        return {"manual": manual, "own_partial": own_partial, "own_ready": own_ready}
+        return {
+            "manual": manual,
+            "own_partial": own_partial,
+            "own_ready": own_ready,
+            "anomalous_done": anomalous_done,
+        }
 
     for name in os.listdir(DOWNLOAD_DIR):
         full = os.path.join(DOWNLOAD_DIR, name)
@@ -457,15 +483,20 @@ def _scan_downloads() -> dict:
             own_ready.append((qid, it, full))
         else:
             # done / fail / skip с файлом на диске — аномалия.
-            # Файл должен был быть удалён (done) или не создаваться (fail/skip).
-            # Считаем manual, чтобы не потерять: спросим пользователя при старте.
+            # НЕ отправляем сразу: сначала проверим в «Избранном»,
+            # вдруг файл уже улетел (os.remove упал и т.п.).
             print(
                 f"  ⚠️  файл {name}: статус «{status}» в JSON, "
                 f"но файл на диске — считаю manual"
             )
-            manual.append(full)
+            anomalous_done.append((qid, it, full))
 
-    return {"manual": manual, "own_partial": own_partial, "own_ready": own_ready}
+    return {
+        "manual": manual,
+        "own_partial": own_partial,
+        "own_ready": own_ready,
+        "anomalous_done": anomalous_done,
+    }
 
 # ---------- Скачивание ----------
 
@@ -503,8 +534,24 @@ async def download_with_retry(
     size_holder: dict | None = None, max_retries: int = 3,
     on_path_known=None,
 ):
-    target_msg = await client.get_messages(chat_id, ids=msg_id)
+    try:
+        target_msg = await client.get_messages(chat_id, ids=msg_id)
+    except ChannelPrivateError:
+        print(
+            f"\n[download] канал {chat_id} приватный или аккаунт "
+            f"не состоит в нём — пропуск {chat_id}/{msg_id}"
+        )
+        return None
+    except FloodWaitError as fwe:
+        print(f"\n[download] FloodWait {fwe.seconds}s при get_messages — жду")
+        await asyncio.sleep(fwe.seconds)
+        target_msg = await client.get_messages(chat_id, ids=msg_id)
+
     if not target_msg or not target_msg.media:
+        print(
+            f"[download] сообщение {chat_id}/{msg_id} не найдено "
+            f"или не содержит медиа — пропуск"
+        )
         return None
 
     if size_holder is not None:
@@ -707,12 +754,25 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         )
 
 # ---------- Статусы ----------
-def _render_status(st: dict, full_link: str) -> str:
+def _render_status(st: dict, full_link: str,
+                   queue_pos: int | None = None,
+                   queue_total: int | None = None) -> str:
     if st["status"] == "fail":
         return f"❌ {full_link}"
     if st["status"] == "skip":
         return f"⚠️ {full_link} (пропущено)"
     if st["status"] == "downloaded":
+        # ✅ Размер + позиция в очереди отправки
+        # (позиция = индекс в q["items"] по порядку, а не среди
+        # только скачанных — upload-воркер идёт строго по items).
+        sz = st.get("up_total", 0) or st.get("file_size", 0) or 0
+        parts = []
+        if sz > 0:
+            parts.append(human_size(sz))
+        if queue_pos is not None and queue_total is not None:
+            parts.append(f"{queue_pos} из {queue_total}")
+        if parts:
+            return f"⏳ ожидание ({', '.join(parts)}) {full_link}"
         return f"⏳ ожидание... {full_link}"
     if st["status"] == "uploading":
         cur = st.get("up_current", 0)
@@ -737,14 +797,17 @@ def _initial_status_text(it: dict) -> str:
     """Начальный текст статус-сообщения для восстановленного элемента."""
     link = it.get("link", "")
     status = it.get("status", "pending")
-    if status == "downloading":
-        return f"⬇️ 0.0% {link}"
-    if status == "downloaded":
-        return f"⏳ ожидание... {link}"
-    if status == "uploading":
-        return f"📤 0.0% {link}"
-    # pending и всё остальное
-    return f"📋 {link}"
+    st_stub = {
+        "status": status,
+        "percent": 0.0,
+        "current": 0,
+        "total": 0,
+        "up_current": 0,
+        "up_total": it.get("file_size", 0) or 0,
+        "file_size": it.get("file_size", 0) or 0,
+        "up_percent": 0.0,
+    }
+    return _render_status(st_stub, link)
 
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
     st = batch["link_states"].get(key)
@@ -756,8 +819,30 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
         if not force and now - st.get("last_edit", 0) < 3:
             return
         st["last_edit"] = now
+
+        # ✅ Вычисляем позицию в очереди отправки — только для
+        # downloaded-элементов (для остальных статусов не нужно).
+        queue_pos = None
+        queue_total = None
+        if st.get("status") == "downloaded":
+            batch_id = batch.get("batch_id")
+            if batch_id is not None:
+                q = queues.get(batch_id)
+                if q is not None:
+                    items = q.get("items", [])
+                    queue_total = len(items)
+                    for i, it in enumerate(items):
+                        if (it["chat_id"] == key[0]
+                                and it["msg_id"] == key[1]):
+                            queue_pos = i + 1
+                            break
+
         try:
-            await status_msg.edit(_render_status(st, full_link))
+            await status_msg.edit(_render_status(
+                st, full_link,
+                queue_pos=queue_pos,
+                queue_total=queue_total,
+            ))
         except MessageNotModifiedError:
             pass
         except FloodWaitError as fwe:
@@ -862,18 +947,26 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                 continue
 
             else:
-                if status == "fail":
-                    text = f"❌ {full_link}"
-                elif status == "skip":
-                    text = f"⚠️ {full_link} (пропущено)"
-                elif status == "done":
-                    text = f"✅ {full_link}"
-                elif status == "downloaded":
-                    text = f"⏳ {full_link} (ожидание...)"
-                elif status == "uploading":
-                    text = f"📤 {full_link} (отправляю...)"
-                else:
-                    text = f"📋 {full_link}"
+                # ✅ Считаем позицию в очереди для downloaded-элементов
+                queue_pos = None
+                queue_total = None
+                if status == "downloaded":
+                    queue_total = len(q["items"])
+                    queue_pos = idx + 1
+
+                # ✅ Используем _render_status — тот же формат, что и
+                # в _update_status_msg (размер + позиция для downloaded).
+                # Берём st из in-memory, чтобы размер был актуальный;
+                # если st нет — fallback на JSON.
+                st_for_render = batch["link_states"].get(key) or {
+                    "status": status,
+                    "up_total": it.get("file_size", 0) or 0,
+                }
+                text = _render_status(
+                    st_for_render, full_link,
+                    queue_pos=queue_pos,
+                    queue_total=queue_total,
+                )
                 try:
                     msg = await client.send_message("me", text)
                 except FloodWaitError as fwe:
@@ -905,9 +998,17 @@ async def reconcile_batch(batch_id: int, force: bool = False):
             elif it["status"] == "downloaded":
                 st["status"] = "downloaded"
                 st["up_current"] = 0
-                st["up_total"] = 0
+                # ✅ НЕ сбрасываем up_total — это размер файла,
+                # он нужен для отображения в _render_status
+                # (⏳ ожидание (размер, X из N)).
                 st["up_percent"] = 0.0
                 st["last_up_cb"] = 0.0
+                # ✅ Дополнительно: если в st ещё нет file_size,
+                # подтягиваем из JSON (для восстановленных очередей).
+                if it.get("file_size"):
+                    st["file_size"] = it["file_size"]
+                    if not st.get("up_total"):
+                        st["up_total"] = it["file_size"]
             else:
                 st["last_edit"] = 0.0
                 st["last_cb"] = 0.0
@@ -982,7 +1083,10 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
 
     key = (chat_id, msg_id)
     if key in processed:
-        return "skip"
+        # ✅ НЕ "skip" (иначе b["skip"] растёт при каждом повторе
+        # и batch закрывается раньше времени). "deferred" не
+        # инкрементит счётчики.
+        return "deferred"
     processed.add(key)
 
     st = batch["link_states"].get(key)
@@ -1004,8 +1108,11 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             f"⏭  пропуск {full_link}: уже {item.get('status')} "
             f"(повторный process_link)"
         )
-        _release_processed(key, "skip")
-        return "skip"
+        # ✅ "deferred" вместо "skip": счётчики уже учтены
+        # при первом завершении. Повторный "skip" их перезапишет
+        # (b["skip"] растёт, batch закрывается раньше времени).
+        _release_processed(key, "deferred")
+        return "deferred"
 
     filename = None
     size_holder = {"size": 0}
@@ -1062,18 +1169,17 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 except FloodWaitError:
                     _log(
                         f"⚠️  {full_link}: FloodWait при проверке me — "
-                        f"оставляю uploading (безопаснее)"
+                        f"ставлю downloaded (upload-воркер подхватит)"
                     )
+                    # ✅ downloaded (не uploading), чтобы _upload_worker
+                    # не ждал вечно. Следующий цикл — отправит.
                     _mark_item(
                         batch_id, chat_id, msg_id,
-                        status="uploading",
+                        status="downloaded",
                     )
-                    st["status"] = "uploading"
+                    st["status"] = "downloaded"
                     await _update_status_msg(batch, key, full_link, force=True)
                     _release_processed(key, "deferred")
-                    # ✅ "deferred" — link_worker НЕ инкрементит счётчик,
-                    # batch НЕ закроется, элемент будет обработан при
-                    # следующем запуске через resume_pending_queues.
                     return "deferred"
 
                 if found_id is not None:
@@ -1096,6 +1202,10 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                              f"{os.path.basename(filename)}")
                     except Exception:
                         pass
+                    # 1) Сначала обнуляем id в JSON.
+                    _mark_item(batch_id, chat_id, msg_id,
+                               status_msg_id=None, slot_msg_id=None)
+                    # 2) Потом удаляем старое сообщение.
                     status_msg = batch["status_msgs"].pop(key, None)
                     if status_msg is not None:
                         old_id = status_msg.id
@@ -1110,12 +1220,6 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                                 f"⚠️  не удалось удалить статус {full_link} "
                                 f"(id={old_id}): {e}"
                             )
-                    # ✅ Обнуляем status_msg_id И slot_msg_id (если совпадают).
-                    # Иначе reconcile увидит несуществующий slot_msg_id и решит,
-                    # что слот «уже в чате» — плейсхолдер не создастся, но
-                    # сообщение будет удалено. Для done-элемента это значит,
-                    # что в чате останется только файл без позиционного «якоря».
-                    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
                     if REORDER_AFTER_EACH_FILE:
                         await request_reconcile(batch_id, force=False)
                     return _release_processed(key, "ok")
@@ -1221,6 +1325,17 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         _release_processed(key, "downloaded")
         return "downloaded"
 
+    except ChannelPrivateError:
+        _log(
+            f"❌ {full_link}: канал приватный или аккаунт не состоит в нём"
+        )
+        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        st["status"] = "fail"
+        await _update_status_msg(batch, key, full_link, force=True)
+        _release_processed(key, "fail")
+        if REORDER_AFTER_EACH_FILE:
+            await request_reconcile(batch_id, force=False)
+        return "fail"
     except Exception as e:
         _log(f"❌ {full_link}: {type(e).__name__}: {e}")
 
@@ -1515,8 +1630,11 @@ async def _upload_worker():
                         break
 
                 if failed_missing:
-                    # ✅ Пометили fail — пересмотрим batch на след. цикле
-                    # (возможно, следующий элемент уже downloaded).
+                    _log(
+                        f"❌ upload-воркер: batch #{batch_id}: "
+                        f"ok={b['ok']}, skip={b['skip']}, fail={b['fail']}, "
+                        f"total={b['total']}"
+                    )
                     await _maybe_finish_batch(batch_id)
                     continue
                 
@@ -1697,6 +1815,10 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     )
     st["status"] = "done"
 
+    # 1) Сначала обнуляем id в JSON — чтобы reconcile, если и создаст
+    #    новое сообщение, не был затёрт последующим _mark_item.
+    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
+    # 2) Теперь безопасно удаляем старое сообщение.
     status_msg = batch["status_msgs"].pop(key, None)
     if status_msg is not None:
         old_id = status_msg.id
@@ -1711,7 +1833,6 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
                 f"⚠️  не удалось удалить статус {full_link} "
                 f"(id={old_id}): {e}"
             )
-    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
 
     if os.path.exists(filename):
         try:
@@ -1786,12 +1907,14 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
                                    upload_retries=retries + 1,
                                    status="downloaded")
-                        asyncio.create_task(
+                        task = asyncio.create_task(
                             _run_manual_upload(
                                 batch_id, it,
                                 os.path.join(DOWNLOAD_DIR, local)
                             )
                         )
+                        _pending_manual_uploads.add(task)
+                        task.add_done_callback(_pending_manual_uploads.discard)
                         _log(
                             f"  🐕 #{batch_id} {it['link']}: "
                             f"повторно в manual upload (попытка {retries + 1}/3)"
@@ -1808,6 +1931,62 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                 ]
                 if not candidates:
                     continue
+
+                # ✅ СТРОГИЙ ПОРЯДОК: не трогаем downloaded/uploading,
+                # если перед ними по порядку есть не-терминальный
+                # элемент (pending/downloading/uploading/processing).
+                # upload-воркер СТРОГО ждёт первый по порядку — эти
+                # «downloaded» не зависли, а стоят в очереди.
+                # Без этой проверки watchdog через 3 цикла (180 сек)
+                # пометит их fail, хотя они просто ждут.
+                items_list = q.get("items", [])
+                candidate_indices = []
+                for cand in candidates:
+                    for i, it_x in enumerate(items_list):
+                        if (it_x["chat_id"] == cand["chat_id"]
+                                and it_x["msg_id"] == cand["msg_id"]):
+                            candidate_indices.append(i)
+                            break
+
+                if candidate_indices:
+                    first_cand_idx = min(candidate_indices)
+                    # Барьер = не-терминальный элемент ПЕРЕД первым candidate
+                    barrier = None
+                    for i in range(first_cand_idx):
+                        it_b = items_list[i]
+                        if it_b.get("status") in (
+                            "pending", "downloading", "uploading"
+                        ):
+                            barrier = it_b
+                            break
+                        if (it_b["chat_id"], it_b["msg_id"]) in processed:
+                            barrier = it_b
+                            break
+
+                    if barrier is not None:
+                        # Логируем раз в смену барьера, не спамим.
+                        bkey = (barrier["chat_id"], barrier["msg_id"],
+                                barrier.get("status"))
+                        bstate = b.setdefault("_wd_barrier", {})
+                        if bstate.get("key") != bkey:
+                            bstate["key"] = bkey
+                            bstate["ts"] = now
+                            _log(
+                                f"🐕 watchdog: batch #{batch_id} — "
+                                f"перед downloaded есть барьер "
+                                f"{barrier['link']} ({barrier.get('status')}) "
+                                f"— ждём строгого порядка, не трогаем "
+                                f"{len(candidates)} downloaded"
+                            )
+                        # ✅ Сбрасываем таймаут watchdog, пока барьер стоит.
+                        # Иначе после снятия барьера elapsed = now - wd.ts
+                        # будет > 60 сек (мы не обновляли ts, пока ждали),
+                        # и watchdog обработает downloaded СРАЗУ, без
+                        # повторного «дам 60s». Нам нужно, чтобы после
+                        # снятия барьера отсчёт начался заново.
+                        b.pop("_wd", None)
+                        continue
+                    b.pop("_wd_barrier", None)
 
                 key = tuple((id(it), it.get("status")) for it in candidates)
                 wd = b.setdefault("_wd", {})
@@ -1837,11 +2016,13 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                     if cur is None:
                         continue
                     if cur.get("status") in ("done", "fail", "skip"):
-                        _log(
-                            f"  🐕 #{batch_id} {it['link']}: "
-                            f"уже {cur.get('status')} — пропуск"
-                        )
-                        continue
+                        # ✅ Пропуск, если _upload_worker уже отправляет
+                        if (it["chat_id"], it["msg_id"]) in b.get("_uploading", set()):
+                            _log(
+                                f"  🐕 #{batch_id} {it['link']}: "
+                                f"уже {cur.get('status')} — пропуск"
+                            )
+                            continue
 
                     # ✅ Пропуск, если process_link уже работает над элементом.
                     # send_file для 1 GB идёт минуты, watchdog за это время
@@ -2174,9 +2355,17 @@ async def resume_pending_queues():
                         "last_cb": 0.0,
                         "last_edit": 0.0,
                         "up_current": 0,
-                        "up_total": 0,
+                        # ✅ Для downloaded/uploading — размер из JSON,
+                        # чтобы _render_status показал его сразу.
+                        "up_total": (
+                            it.get("file_size", 0) or 0
+                            if it.get("status") in ("downloaded", "uploading")
+                            else 0
+                        ),
                         "up_percent": 0.0,
                         "last_up_cb": 0.0,
+                        # ✅ Сохраняем file_size как fallback для _render_status
+                        "file_size": it.get("file_size", 0) or 0,
                     }
                     link_states[key] = st
 
@@ -2243,6 +2432,7 @@ async def resume_pending_queues():
 
                 # Создаём batch
                 batches[qid] = {
+                    "batch_id": qid,
                     "event": _make_fake_event(),
                     "links": [
                         (it["chat_id"], it["msg_id"], it["link"])
@@ -2429,9 +2619,16 @@ async def offer_send_downloaded():
                     "last_cb": 0.0,
                     "last_edit": 0.0,
                     "up_current": 0,
-                    "up_total": 0,
+                    # ✅ Для downloaded/uploading — размер из JSON
+                    "up_total": (
+                        it.get("file_size", 0) or 0
+                        if it.get("status") in ("downloaded", "uploading")
+                        else 0
+                    ),
                     "up_percent": 0.0,
                     "last_up_cb": 0.0,
+                    # ✅ fallback для _render_status
+                    "file_size": it.get("file_size", 0) or 0,
                 }
 
                 # Пробуем переиспользовать существующее статус-сообщение
@@ -2497,6 +2694,7 @@ async def offer_send_downloaded():
                         )
 
             batches[qid] = {
+                "batch_id": qid,
                 "event": _make_fake_event(),
                 "links": [
                     (it["chat_id"], it["msg_id"], it["link"])
@@ -2691,14 +2889,15 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     )
     st["status"] = "done"
 
+    # 1) Сначала обнуляем id в JSON.
+    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None, slot_msg_id=None)
+    # 2) Потом удаляем старое сообщение.
     status_msg = batch["status_msgs"].pop(key, None)
     if status_msg is not None:
         try:
             await status_msg.delete()
         except Exception as e:
             _log(f"⚠️  не удалось удалить статус файла: {e}")
-    # Обнуляем status_msg_id в JSON после удаления
-    _mark_item(batch_id, chat_id, msg_id, status_msg_id=None)
 
     try:
         if os.path.exists(path):
@@ -2795,6 +2994,7 @@ async def enqueue_manual_files(paths: list[str]):
         queues[batch_id] = q
 
         batches[batch_id] = {
+            "batch_id": batch_id,
             "event": _make_fake_event(),
             "links": [(it["chat_id"], it["msg_id"], it["link"]) for it in items],
             "status_msgs": status_msgs,
@@ -2811,7 +3011,9 @@ async def enqueue_manual_files(paths: list[str]):
 
         for it in items:
             p = os.path.join(DOWNLOAD_DIR, it["local_file"])
-            asyncio.create_task(_run_manual_upload(batch_id, it, p))
+            task = asyncio.create_task(_run_manual_upload(batch_id, it, p))
+            _pending_manual_uploads.add(task)
+            task.add_done_callback(_pending_manual_uploads.discard)
 
 # ---------- Обработчик сообщений ----------
 @client.on(events.NewMessage(chats="me"))
@@ -2928,18 +3130,59 @@ async def handle_saved_messages(event):
 
     # Всё создание batch — под локом, чтобы параллельные сообщения
     # не получили одинаковый batch_id и не перемешали порядок сообщений.
+    # 1) Отправляем статус-сообщения ВНЕ лока — FloodWait не блокирует
+    #    другие входящие сообщения со ссылками.
+    status_msgs: dict[tuple, any] = {}
+    status_creation_failed = False
+    for chat_id, msg_id, full_link in links:
+        try:
+            status_msg = await event.respond(f"📋 {full_link}")
+        except FloodWaitError as fwe:
+            _log(
+                f"⏳ FloodWait {fwe.seconds}s при создании статуса "
+                f"{full_link} — жду и повторяю"
+            )
+            await asyncio.sleep(fwe.seconds)
+            try:
+                status_msg = await event.respond(f"📋 {full_link}")
+            except Exception as e:
+                _log(
+                    f"❌ не удалось создать статус {full_link}: "
+                    f"{type(e).__name__}: {e} — пачка пропущена"
+                )
+                status_creation_failed = True
+                break
+        except Exception as e:
+            _log(
+                f"❌ не удалось создать статус {full_link}: "
+                f"{type(e).__name__}: {e} — пачка пропущена"
+            )
+            status_creation_failed = True
+            break
+        status_msgs[(chat_id, msg_id)] = status_msg
+
+    if status_creation_failed:
+        # Удаляем уже созданные статусы и выходим — исходное сообщение
+        # со ссылками останется, пользователь сможет повторить.
+        for m in status_msgs.values():
+            _schedule_delete(m, delay=0)
+        return
+
+    # 2) Под коротким локом — только создание batch и постановка в очередь.
+    # ✅ batch_id определяем заранее: если handle_saved_messages будет
+    # отменён (CancelledError) до входа в лок или между локом и
+    # удалением исходного сообщения, _log(... batch #{batch_id})
+    # не должен бросать NameError.
+    batch_id = None
     async with batch_create_lock:
         batch_counter["id"] += 1
         batch_id = batch_counter["id"]
 
         link_states: dict[tuple, dict] = {}
-        status_msgs: dict[tuple, any] = {}
         items: list[dict] = []
 
         for chat_id, msg_id, full_link in links:
-            status_msg = await event.respond(f"📋 {full_link}")
             key = (chat_id, msg_id)
-            status_msgs[key] = status_msg
             link_states[key] = {
                 "status": "pending",
                 "percent": 0.0,
@@ -2957,7 +3200,7 @@ async def handle_saved_messages(event):
                 "msg_id": msg_id,
                 "link": full_link,
                 "status": "pending",
-                "status_msg_id": status_msg.id,
+                "status_msg_id": status_msgs[(chat_id, msg_id)].id,
                 "slot_msg_id": None,
                 "file_message_id": None,
                 "local_file": None,
@@ -2967,6 +3210,7 @@ async def handle_saved_messages(event):
         _create_queue(batch_id, items)
 
         batches[batch_id] = {
+            "batch_id": batch_id,
             "event": event,
             "links": links,
             "status_msgs": status_msgs,
@@ -2987,20 +3231,23 @@ async def handle_saved_messages(event):
 
     # Удаление исходного сообщения — вне лока: не блокирует создание
     # других batch'ей и не может «съесть» ответ другого обработчика.
+    # ✅ batch_id может быть None (если лок не выполнился из-за
+    # CancelledError) — в этом случае не логируем batch.
+    batch_suffix = f" (batch #{batch_id})" if batch_id is not None else ""
     try:
         await event.message.delete()
-        _log(f"🗑  удалено исходное сообщение со ссылками (batch #{batch_id})")
+        _log(f"🗑  удалено исходное сообщение со ссылками{batch_suffix}")
     except FloodWaitError as fwe:
         _log(
             f"  ⏳ FloodWait {fwe.seconds}s при удалении исходного "
-            f"сообщения (batch #{batch_id})"
+            f"сообщения{batch_suffix}"
         )
         await asyncio.sleep(fwe.seconds)
         try:
             await event.message.delete()
             _log(
                 f"🗑  удалено исходное сообщение "
-                f"(после FloodWait, batch #{batch_id})"
+                f"(после FloodWait{batch_suffix})"
             )
         except Exception:
             pass
@@ -3010,6 +3257,8 @@ async def handle_saved_messages(event):
 
 def _print_scan_summary(scan: dict):
     """Информационный вывод о результатах скана downloads/."""
+
+    # ✅ manual — файлы без записи в очереди
     if scan["manual"]:
         print(f"\n📂 Найдено файлов без записи в очереди: {len(scan['manual'])}")
         for f in scan["manual"][:20]:
@@ -3020,6 +3269,17 @@ def _print_scan_summary(scan: dict):
             print(f"   • {os.path.basename(f)} ({sz})")
         if len(scan["manual"]) > 20:
             print(f"   … и ещё {len(scan['manual']) - 20}")
+
+    # ✅ anomalous_done — терминальный статус в JSON, но файл на диске
+    if scan.get("anomalous_done"):
+        print(
+            f"\n📂 Найдено файлов с терминальным статусом в JSON, "
+            f"но на диске: {len(scan['anomalous_done'])} — проверю в «Избранном»"
+        )
+        for _, it, f in scan["anomalous_done"][:20]:
+            print(f"   • {os.path.basename(f)} ← {it['link']}")
+        if len(scan["anomalous_done"]) > 20:
+            print(f"   … и ещё {len(scan['anomalous_done']) - 20}")
 
     if scan["own_partial"]:
         print(
@@ -3132,6 +3392,68 @@ async def main():
     )
     print(f"  📦 Лимит на отправку: {human_size(limit)}")
 
+    # --- 4.5. Аномальные done-файлы: проверить в «Избранном» ---
+    if scan.get("anomalous_done"):
+        print(
+            f"\n🔍 Проверяю {len(scan['anomalous_done'])} аномальных "
+            f"файлов в «Избранном»..."
+        )
+        for qid, it, full in scan["anomalous_done"]:
+            name = os.path.basename(full)
+            try:
+                size = os.path.getsize(full)
+            except Exception:
+                size = 0
+            try:
+                found_id = await _find_in_me(
+                    display_name=name, file_size=size,
+                )
+            except FloodWaitError as fwe:
+                print(
+                    f"  ⏳ FloodWait {fwe.seconds}s при проверке {name} — "
+                    f"оставляю как manual"
+                )
+                await asyncio.sleep(fwe.seconds)
+                scan["manual"].append(full)
+                continue
+            except Exception as e:
+                print(f"  ⚠️  ошибка проверки {name}: {e} — оставляю как manual")
+                scan["manual"].append(full)
+                continue
+
+            if found_id is not None:
+                # Уже в «Избранном» — помечаем done, файл удаляем
+                it["status"] = "done"
+                it["file_message_id"] = found_id
+                it["local_file"] = None
+                it["downloaded_at"] = None
+                q = queues.get(qid) or _load_queue(qid)
+                if q is not None:
+                    # синхронизируем элемент в очереди
+                    for entry in q.get("items", []):
+                        if (entry.get("chat_id") == it["chat_id"]
+                                and entry.get("msg_id") == it["msg_id"]):
+                            entry.update({
+                                "status": "done",
+                                "file_message_id": found_id,
+                                "local_file": None,
+                                "downloaded_at": None,
+                            })
+                            break
+                    queues[qid] = q
+                    _save_queue(qid)
+                try:
+                    os.remove(full)
+                    print(
+                        f"  ♻️  {name}: уже в «Избранном» "
+                        f"(id={found_id}) — помечен done, файл удалён"
+                    )
+                except Exception as e:
+                    print(f"  ⚠️  не удалось удалить {name}: {e}")
+            else:
+                # В «Избранном» нет — это реальный manual
+                print(f"  📂 {name}: в «Избранном» не найден — считаю manual")
+                scan["manual"].append(full)
     # --- 5. Запуск воркеров и watchdog ---
     workers = [
         asyncio.create_task(link_worker(i + 1))
@@ -3231,6 +3553,10 @@ async def main():
             *workers,
             return_exceptions=True,
         )
+        if _pending_manual_uploads:
+            for t in list(_pending_manual_uploads):
+                t.cancel()
+            await asyncio.gather(*_pending_manual_uploads, return_exceptions=True)
         if _pending_deletions:
             await asyncio.gather(*_pending_deletions, return_exceptions=True)
         await asyncio.sleep(0.5)
