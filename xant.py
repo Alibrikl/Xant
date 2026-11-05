@@ -79,7 +79,6 @@ LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 LINK_REGEX = re.compile(LINK_PATTERN, re.IGNORECASE)
 
 processed: set[tuple] = set()
-cancel_flag = {"cancel": False}
 in_progress = {"count": 0}
 
 batches: dict[int, dict] = {}
@@ -1420,21 +1419,7 @@ async def link_worker(worker_id: int):
         in_progress["count"] += 1
 
         try:
-            if cancel_flag["cancel"]:
-                result = "skip"
-                _mark_item(batch_id, chat_id, msg_id, status="skip")
-                batch = batches.get(batch_id)
-                if batch is not None:
-                    st = batch["link_states"].get((chat_id, msg_id))
-                    if st is not None:
-                        st["status"] = "skip"
-                        await _update_status_msg(
-                            batch, (chat_id, msg_id), full_link, force=True
-                        )
-                _log(f"⏭  worker #{worker_id}: пропуск {full_link} (cancel)")
-            else:
-                result = await process_link(chat_id, msg_id, full_link, batch_id)
-
+            result = await process_link(chat_id, msg_id, full_link, batch_id)
             batch = batches.get(batch_id)
             if batch is not None:
                 if result == "deferred":
@@ -3115,24 +3100,8 @@ async def handle_saved_messages(event):
     text = event.raw_text
     cmd = text.strip().lower()
 
-    # ---------- /stop ----------
-    if cmd == "/stop":
-        cancel_flag["cancel"] = True
-        await event.respond(
-            "⛔ Новые ссылки будут пропущены. "
-            "Уже скачиваемые загрузки продолжатся."
-        )
-        return
-
-    # ---------- /resume ----------
-    if cmd == "/resume":
-        cancel_flag["cancel"] = False
-        await event.respond("▶️ Обработка новых ссылок возобновлена.")
-        return
-
     # ---------- /quit ----------
     if cmd in ("/quit", "/exit", "/shutdown"):
-        cancel_flag["cancel"] = True
         await event.respond(
             "🛑 Останавливаюсь. Текущие загрузки завершатся, затем выход."
         )
@@ -3141,7 +3110,6 @@ async def handle_saved_messages(event):
 
     # ---------- /clear ----------
     if cmd == "/clear":
-        cancel_flag["cancel"] = False
 
         # ✅ Предупреждаем, если воркеры уже что-то качают:
         # их элементы уже в process_link, /clear их не отменит.
@@ -3194,7 +3162,6 @@ async def handle_saved_messages(event):
             f"├ Ожидает в очереди: {link_queue.qsize()}\n"
             f"├ В работе: {in_progress['count']} / {CONCURRENT_DOWNLOADS}\n"
             f"├ Активных пачек: {len(batches)}\n"
-            f"├ Пауза (/stop): {'да' if cancel_flag['cancel'] else 'нет'}\n"
             f"└ Обработано уникальных: {len(processed)}"
         )
         return
@@ -3620,7 +3587,10 @@ async def main():
         f"├ Одновременно качается: {CONCURRENT_DOWNLOADS}\n"
         f"├ После загрузки: файл заменит сообщение (только при успехе)\n"
         f"├ Перетусовка: {'после каждого файла' if REORDER_AFTER_EACH_FILE else 'по завершении пачки'}\n"
-        f"└ Команды: /stop, /resume, /quit, /clear, /stats"
+        f"└ Команды:\n"
+        f"└ /quit - остановка скрипта (очередь сохраняется)\n"
+        f"└ /clear - очистка очереди\n"
+        f"└ /stats - статистика"
     )
 
     try:
