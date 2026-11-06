@@ -748,6 +748,9 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
         st["last_edit"] = now
 
         # ПАТЧ 4: берём статус из JSON, а не из st — он источник истины.
+        # ПАТЧ 5: 📤 рисуем ТОЛЬКО если элемент реально в _uploading (сейчас
+        # отправляется). Иначе, даже если в JSON застрял "uploading",
+        # показываем ⏳.
         batch_id = batch.get("batch_id")
         json_status = None
         item = None
@@ -755,6 +758,9 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
             item = _find_item(batch_id, key[0], key[1])
             if item is not None:
                 json_status = item.get("status")
+
+        if json_status == "uploading" and key not in batch.get("_uploading", set()):
+            json_status = "downloaded"
 
         queue_pos = None
         queue_total = None
@@ -888,11 +894,17 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                 if not st_for_render.get("file_size"):
                     st_for_render["file_size"] = it.get("file_size", 0) or 0
 
+                # ПАТЧ 5: 📤 — только если элемент реально в _uploading.
+                status_for_render = status
+                if (status == "uploading"
+                        and key not in batch.get("_uploading", set())):
+                    status_for_render = "downloaded"
+
                 text = _render_status(
                     st_for_render, full_link,
                     queue_pos=queue_pos,
                     queue_total=queue_total,
-                    force_status=status,   # ← явно из JSON
+                    force_status=status_for_render,
                 )
                 try:
                     msg = await client.send_message("me", text)
