@@ -1145,76 +1145,91 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             filename = os.path.join(DOWNLOAD_DIR, already)
             _log(f"📂 файл уже скачан ранее: {filename}")
 
-            if item.get("status") == "uploading":
-                local_size = os.path.getsize(filename)
-                _log(
-                    f"🔍 {full_link}: статус uploading — проверяю me "
-                    f"(имя={os.path.basename(filename)}, "
-                    f"размер={human_size(local_size)})"
+            # ПАТЧ U6: проверяем me для uploading И downloaded.
+            # Если файл уже в «Избранном» — не отправляем, помечаем done,
+            # удаляем локальный, редактируем статус в «✅ уже в me».
+            local_size = os.path.getsize(filename)
+            _log(
+                f"🔍 {full_link}: статус "
+                f"«{item.get('status')}» — проверяю me "
+                f"(имя={os.path.basename(filename)}, "
+                f"размер={human_size(local_size)})"
+            )
+            try:
+                found_id = await _find_in_me(
+                    display_name=os.path.basename(filename),
+                    file_size=local_size,
                 )
-                try:
-                    found_id = await _find_in_me(
-                        display_name=os.path.basename(filename),
-                        file_size=local_size,
-                    )
-                except FloodWaitError:
-                    _log(
-                        f"⚠️  {full_link}: FloodWait при проверке me — "
-                        f"ставлю downloaded (upload-воркер подхватит)"
-                    )
-                    _mark_item(batch_id, chat_id, msg_id, status="downloaded")
-                    st["status"] = "downloaded"
-                    await _update_status_msg(batch, key, full_link, force=True)
-                    _release_processed(key, "deferred")
-                    return "deferred"
+            except FloodWaitError:
+                _log(
+                    f"⚠️  {full_link}: FloodWait при проверке me — "
+                    f"ставлю downloaded (upload-воркер подхватит)"
+                )
+                _mark_item(batch_id, chat_id, msg_id, status="downloaded")
+                st["status"] = "downloaded"
+                await _update_status_msg(batch, key, full_link, force=True)
+                _release_processed(key, "deferred")
+                return "deferred"
+            except Exception as e:
+                _log(
+                    f"⚠️  {full_link}: ошибка проверки me "
+                    f"({type(e).__name__}: {e}) — считаю, что не найден"
+                )
+                found_id = None
 
-                if found_id is not None:
-                    _log(
-                        f"✅ {full_link}: найден в me (id={found_id}), "
-                        f"пропускаю повторную отправку"
-                    )
-                    _mark_item(
-                        batch_id, chat_id, msg_id,
-                        status="done",
-                        file_message_id=found_id,
-                        local_file=None,
-                        downloaded_at=None,
-                        upload_retries=0,
-                    )
-                    st["status"] = "done"
+            if found_id is not None:
+                _log(
+                    f"✅ {full_link}: найден в me (id={found_id}), "
+                    f"пропускаю повторную отправку"
+                )
+                _mark_item(
+                    batch_id, chat_id, msg_id,
+                    status="done",
+                    file_message_id=found_id,
+                    local_file=None,
+                    downloaded_at=None,
+                    upload_retries=0,
+                )
+                st["status"] = "done"
+                try:
+                    os.remove(filename)
+                    _log(f"🧹 удалён локальный файл: "
+                         f"{os.path.basename(filename)}")
+                except Exception:
+                    pass
+                # ПАТЧ U6: НЕ удаляем статус, а редактируем в «✅ уже в me».
+                status_msg = batch["status_msgs"].pop(key, None)
+                if status_msg is not None:
                     try:
-                        os.remove(filename)
-                        _log(f"🧹 удалён локальный файл: "
-                             f"{os.path.basename(filename)}")
-                    except Exception:
-                        pass
-                    status_msg = batch["status_msgs"].pop(key, None)
-                    if status_msg is not None:
-                        old_id = status_msg.id
-                        try:
-                            await status_msg.delete()
-                            _log(
-                                f"🗑  удалён статус загрузки {full_link}: "
-                                f"сообщение id={old_id}"
-                            )
-                            _mark_item(batch_id, chat_id, msg_id,
-                                       status_msg_id=None, slot_msg_id=None)
-                        except Exception as e:
-                            _log(
-                                f"⚠️  не удалось удалить статус {full_link} "
-                                f"(id={old_id}): {e}"
-                            )
-                    else:
+                        await status_msg.edit(
+                            f"✅ {os.path.basename(filename)} "
+                            f"({human_size(local_size)}) — уже в Избранном"
+                        )
+                        _log(
+                            f"✏️  статус {full_link} обновлён в "
+                            f"«✅ уже в Избранном»"
+                        )
                         _mark_item(batch_id, chat_id, msg_id,
                                    status_msg_id=None, slot_msg_id=None)
-                    if REORDER_AFTER_EACH_FILE:
-                        await request_reconcile(batch_id, force=False)
-                    return _release_processed(key, "ok")
+                    except MessageNotModifiedError:
+                        pass
+                    except Exception as e:
+                        _log(
+                            f"⚠️  не удалось обновить статус {full_link}: {e}"
+                        )
+                        _mark_item(batch_id, chat_id, msg_id,
+                                   status_msg_id=None, slot_msg_id=None)
                 else:
-                    _log(
-                        f"📂 {full_link}: в me не найден — "
-                        f"переотправлю"
-                    )
+                    _mark_item(batch_id, chat_id, msg_id,
+                               status_msg_id=None, slot_msg_id=None)
+                if REORDER_AFTER_EACH_FILE:
+                    await request_reconcile(batch_id, force=False)
+                return _release_processed(key, "ok")
+            else:
+                _log(
+                    f"📂 {full_link}: в me не найден — "
+                    f"переотправлю"
+                )
 
             st["status"] = "downloaded"
             _mark_item(
@@ -1223,6 +1238,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                 file_size=os.path.getsize(filename),
             )
             await _update_status_msg(batch, key, full_link, force=True)
+        
         else:
             def _on_path(path):
                 if not item.get("local_file"):
@@ -1653,6 +1669,72 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     display_name = os.path.basename(filename)
     file_size = it.get("file_size") or os.path.getsize(filename)
 
+    # ПАТЧ U7: проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
+    # Если да — НЕ ставим uploading (📤 не мигнёт), сразу done + ✅.
+    try:
+        found_id = await _find_in_me(
+            display_name=display_name,
+            file_size=file_size,
+        )
+    except FloodWaitError:
+        _log(
+            f"⚠️  upload-воркер: {full_link}: FloodWait при проверке me — "
+            f"продолжаю отправку"
+        )
+        found_id = None
+    except Exception as e:
+        _log(
+            f"⚠️  upload-воркер: {full_link}: ошибка проверки me "
+            f"({type(e).__name__}: {e}) — продолжаю отправку"
+        )
+        found_id = None
+
+    if found_id is not None:
+        _log(
+            f"✅ upload-воркер: {full_link}: уже в «Избранном» "
+            f"(id={found_id}), пропускаю отправку"
+        )
+        _mark_item(
+            batch_id, chat_id, msg_id,
+            status="done",
+            file_message_id=found_id,
+            local_file=None,
+            downloaded_at=None,
+            upload_retries=0,
+        )
+        st["status"] = "done"
+
+        # Редактируем статус в «✅ уже в Избранном»
+        status_msg = batch["status_msgs"].pop(key, None)
+        if status_msg is not None:
+            try:
+                await status_msg.edit(
+                    f"✅ {display_name} ({human_size(file_size)}) — уже в «Избранном»"
+                )
+                _mark_item(batch_id, chat_id, msg_id,
+                           status_msg_id=None, slot_msg_id=None)
+            except MessageNotModifiedError:
+                pass
+            except Exception as e:
+                _log(
+                    f"⚠️  upload-воркер: {full_link}: не удалось "
+                    f"обновить статус: {e}"
+                )
+        else:
+            _mark_item(batch_id, chat_id, msg_id,
+                       status_msg_id=None, slot_msg_id=None)
+
+        # Удаляем локальный файл
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+                _log(f"🧹 удалён локальный файл: {os.path.basename(filename)}")
+            except Exception as e:
+                _log(f"⚠️  не удалось удалить {os.path.basename(filename)}: {e}")
+
+        return "ok"
+
+    # Не найден — теперь ставим uploading и отправляем
     st["status"] = "uploading"
     st["up_current"] = 0
     st["up_total"] = file_size
@@ -2658,6 +2740,58 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     display_name = os.path.basename(path)
     file_size = os.path.getsize(path)
 
+    # ПАТЧ U7: проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
+    try:
+        found_id = await _find_in_me(
+            display_name=display_name,
+            file_size=file_size,
+        )
+    except Exception as e:
+        _log(
+            f"⚠️  manual: {full_link}: ошибка проверки me "
+            f"({type(e).__name__}: {e}) — продолжаю отправку"
+        )
+        found_id = None
+
+    if found_id is not None:
+        _log(
+            f"✅ manual: {full_link}: уже в «Избранном» "
+            f"(id={found_id}), пропускаю отправку"
+        )
+        _mark_item(
+            batch_id, chat_id, msg_id,
+            status="done",
+            file_message_id=found_id,
+            local_file=None,
+            downloaded_at=None,
+            upload_retries=0,
+        )
+        st["status"] = "done"
+
+        status_msg = batch["status_msgs"].pop(key, None)
+        if status_msg is not None:
+            try:
+                await status_msg.edit(
+                    f"✅ {display_name} ({human_size(file_size)}) — уже в «Избранном»"
+                )
+                _mark_item(batch_id, chat_id, msg_id,
+                           status_msg_id=None, slot_msg_id=None)
+            except Exception as e:
+                _log(f"⚠️  manual: не удалось обновить статус: {e}")
+        else:
+            _mark_item(batch_id, chat_id, msg_id,
+                       status_msg_id=None, slot_msg_id=None)
+
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                _log(f"🧹 manual: удалён локальный файл: {display_name}")
+        except Exception as e:
+            _log(f"⚠️  manual: не удалось удалить {display_name}: {e}")
+
+        return True
+
+    # Не найден — ставим uploading и отправляем
     st["status"] = "uploading"
     st["up_current"] = 0
     st["up_total"] = file_size
