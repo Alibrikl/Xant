@@ -682,12 +682,14 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
 # ---------- Статусы ----------
 def _render_status(st: dict, full_link: str,
                    queue_pos: int | None = None,
-                   queue_total: int | None = None) -> str:
-    if st["status"] == "fail":
+                   queue_total: int | None = None,
+                   force_status: str | None = None) -> str:
+    status = force_status if force_status is not None else st["status"]
+    if status == "fail":
         return f"❌ {full_link}"
-    if st["status"] == "skip":
+    if status == "skip":
         return f"⚠️ {full_link} (пропущено)"
-    if st["status"] == "downloaded":
+    if status == "downloaded":
         sz = st.get("up_total", 0) or st.get("file_size", 0) or 0
         parts = []
         if sz > 0:
@@ -697,7 +699,7 @@ def _render_status(st: dict, full_link: str,
         if parts:
             return f"⏳ ожидание ({', '.join(parts)}) {full_link}"
         return f"⏳ ожидание... {full_link}"
-    if st["status"] == "uploading":
+    if status == "uploading":
         cur = st.get("up_current", 0)
         tot = st.get("up_total", 0)
         pct = st.get("up_percent", 0.0)
@@ -706,11 +708,11 @@ def _render_status(st: dict, full_link: str,
             f"({human_size(cur)} / {human_size(tot)}) "
             f"{full_link}"
         )
-    if st["status"] == "downloading":
+    if status == "downloading":
         cur = st.get("current", 0)
         tot = st.get("total", 0)
         return (
-            f"⬇️ {st['percent']:.1f}% "
+            f"⬇️ {st.get('percent', 0.0):.1f}% "
             f"({human_size(cur)} / {human_size(tot)}) "
             f"{full_link}"
         )
@@ -730,7 +732,8 @@ def _initial_status_text(it: dict) -> str:
         "file_size": it.get("file_size", 0) or 0,
         "up_percent": 0.0,
     }
-    return _render_status(st_stub, link)
+    # ПАТЧ 4: статус из JSON — источник истины
+    return _render_status(st_stub, link, force_status=status)
 
 
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
@@ -744,10 +747,18 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
             return
         st["last_edit"] = now
 
+        # ПАТЧ 4: берём статус из JSON, а не из st — он источник истины.
+        batch_id = batch.get("batch_id")
+        json_status = None
+        item = None
+        if batch_id is not None:
+            item = _find_item(batch_id, key[0], key[1])
+            if item is not None:
+                json_status = item.get("status")
+
         queue_pos = None
         queue_total = None
-        if st.get("status") == "downloaded":
-            batch_id = batch.get("batch_id")
+        if (json_status or st.get("status")) == "downloaded":
             if batch_id is not None:
                 q = queues.get(batch_id)
                 if q is not None:
@@ -764,6 +775,7 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
                 st, full_link,
                 queue_pos=queue_pos,
                 queue_total=queue_total,
+                force_status=json_status,   # ← ПАТЧ 4
             ))
         except MessageNotModifiedError:
             pass
@@ -771,7 +783,6 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
             await asyncio.sleep(fwe.seconds)
         except Exception:
             pass
-
 
 # ---------- Реконсиляция ----------
 async def reconcile_batch(batch_id: int, force: bool = False):
@@ -862,14 +873,26 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     queue_total = len(q["items"])
                     queue_pos = idx + 1
 
-                st_for_render = batch["link_states"].get(key) or {
-                    "status": status,
-                    "up_total": it.get("file_size", 0) or 0,
-                }
+                # ПАТЧ UI: JSON — источник истины.
+                # st["status"] мог застрять в uploading после deferred/ошибки —
+                # перезаписываем статусом из JSON, чтобы downloaded всегда был ⏳.
+                st_for_render = dict(
+                    batch["link_states"].get(key) or {}
+                )
+                st_for_render["status"] = status
+                if status == "downloaded":
+                    st_for_render["up_current"] = 0
+                    st_for_render["up_percent"] = 0.0
+                if not st_for_render.get("up_total"):
+                    st_for_render["up_total"] = it.get("file_size", 0) or 0
+                if not st_for_render.get("file_size"):
+                    st_for_render["file_size"] = it.get("file_size", 0) or 0
+
                 text = _render_status(
                     st_for_render, full_link,
                     queue_pos=queue_pos,
                     queue_total=queue_total,
+                    force_status=status,   # ← явно из JSON
                 )
                 try:
                     msg = await client.send_message("me", text)
@@ -1389,6 +1412,15 @@ async def _upload_worker():
     while True:
         try:
             await asyncio.sleep(UPLOAD_POLL_INTERVAL)
+
+            # ПАТЧ 7: heartbeat для ВСЕХ batch — _upload_worker дошёл до этой
+            # точки, значит он жив и работает (пусть и над другим batch).
+            # Если он завис внутри _upload_one на _send_media — сюда не
+            # попадёт, heartbeat не обновится, watchdog сработает корректно.
+            hb_now = time.time()
+            for b_hb in batches.values():
+                if not b_hb.get("is_manual"):
+                    b_hb["_last_upload_activity_ts"] = hb_now
 
             for batch_id, b in list(batches.items()):
                 q = queues.get(batch_id)
