@@ -1145,91 +1145,100 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             filename = os.path.join(DOWNLOAD_DIR, already)
             _log(f"📂 файл уже скачан ранее: {filename}")
 
-            # ПАТЧ U6: проверяем me для uploading И downloaded.
-            # Если файл уже в «Избранном» — не отправляем, помечаем done,
-            # удаляем локальный, редактируем статус в «✅ уже в me».
-            local_size = os.path.getsize(filename)
-            _log(
-                f"🔍 {full_link}: статус "
-                f"«{item.get('status')}» — проверяю me "
-                f"(имя={os.path.basename(filename)}, "
-                f"размер={human_size(local_size)})"
-            )
-            try:
-                found_id = await _find_in_me(
-                    display_name=os.path.basename(filename),
-                    file_size=local_size,
-                )
-            except FloodWaitError:
+            # ПАТЧ U8: проверяем me ТОЛЬКО для uploading.
+            # Для downloaded — не проверяем: _upload_worker возьмёт,
+            # _upload_one проверит me перед _send_media (U7).
+            # Это убирает iter_messages для каждого downloaded при старте.
+            if item.get("status") == "uploading":
+                local_size = os.path.getsize(filename)
                 _log(
-                    f"⚠️  {full_link}: FloodWait при проверке me — "
-                    f"ставлю downloaded (upload-воркер подхватит)"
+                    f"🔍 {full_link}: статус uploading — проверяю me "
+                    f"(имя={os.path.basename(filename)}, "
+                    f"размер={human_size(local_size)})"
                 )
-                _mark_item(batch_id, chat_id, msg_id, status="downloaded")
-                st["status"] = "downloaded"
-                await _update_status_msg(batch, key, full_link, force=True)
-                _release_processed(key, "deferred")
-                return "deferred"
-            except Exception as e:
-                _log(
-                    f"⚠️  {full_link}: ошибка проверки me "
-                    f"({type(e).__name__}: {e}) — считаю, что не найден"
-                )
-                found_id = None
-
-            if found_id is not None:
-                _log(
-                    f"✅ {full_link}: найден в me (id={found_id}), "
-                    f"пропускаю повторную отправку"
-                )
-                _mark_item(
-                    batch_id, chat_id, msg_id,
-                    status="done",
-                    file_message_id=found_id,
-                    local_file=None,
-                    downloaded_at=None,
-                    upload_retries=0,
-                )
-                st["status"] = "done"
                 try:
-                    os.remove(filename)
-                    _log(f"🧹 удалён локальный файл: "
-                         f"{os.path.basename(filename)}")
-                except Exception:
-                    pass
-                # ПАТЧ U6: НЕ удаляем статус, а редактируем в «✅ уже в me».
-                status_msg = batch["status_msgs"].pop(key, None)
-                if status_msg is not None:
+                    found_id = await _find_in_me(
+                        display_name=os.path.basename(filename),
+                        file_size=local_size,
+                    )
+                except FloodWaitError:
+                    _log(
+                        f"⚠️  {full_link}: FloodWait при проверке me — "
+                        f"ставлю downloaded (upload-воркер подхватит)"
+                    )
+                    _mark_item(batch_id, chat_id, msg_id, status="downloaded")
+                    st["status"] = "downloaded"
+                    await _update_status_msg(batch, key, full_link, force=True)
+                    _release_processed(key, "deferred")
+                    return "deferred"
+                except Exception as e:
+                    _log(
+                        f"⚠️  {full_link}: ошибка проверки me "
+                        f"({type(e).__name__}: {e}) — считаю, что не найден"
+                    )
+                    found_id = None
+
+                if found_id is not None:
+                    _log(
+                        f"✅ {full_link}: найден в me (id={found_id}), "
+                        f"пропускаю повторную отправку"
+                    )
+                    _mark_item(
+                        batch_id, chat_id, msg_id,
+                        status="done",
+                        file_message_id=found_id,
+                        local_file=None,
+                        downloaded_at=None,
+                        upload_retries=0,
+                    )
+                    st["status"] = "done"
                     try:
-                        await status_msg.edit(
-                            f"✅ {os.path.basename(filename)} "
-                            f"({human_size(local_size)}) — уже в Избранном"
-                        )
-                        _log(
-                            f"✏️  статус {full_link} обновлён в "
-                            f"«✅ уже в Избранном»"
-                        )
-                        _mark_item(batch_id, chat_id, msg_id,
-                                   status_msg_id=None, slot_msg_id=None)
-                    except MessageNotModifiedError:
+                        os.remove(filename)
+                        _log(f"🧹 удалён локальный файл: "
+                             f"{os.path.basename(filename)}")
+                    except Exception:
                         pass
-                    except Exception as e:
-                        _log(
-                            f"⚠️  не удалось обновить статус {full_link}: {e}"
-                        )
+                    status_msg = batch["status_msgs"].pop(key, None)
+                    if status_msg is not None:
+                        try:
+                            await status_msg.edit(
+                                f"✅ {os.path.basename(filename)} "
+                                f"({human_size(local_size)}) — уже в Избранном"
+                            )
+                            _log(
+                                f"✏️  статус {full_link} обновлён в "
+                                f"«✅ уже в Избранном»"
+                            )
+                            _mark_item(batch_id, chat_id, msg_id,
+                                       status_msg_id=None, slot_msg_id=None)
+                        except MessageNotModifiedError:
+                            pass
+                        except Exception as e:
+                            _log(
+                                f"⚠️  не удалось обновить статус {full_link}: {e}"
+                            )
+                            _mark_item(batch_id, chat_id, msg_id,
+                                       status_msg_id=None, slot_msg_id=None)
+                    else:
                         _mark_item(batch_id, chat_id, msg_id,
                                    status_msg_id=None, slot_msg_id=None)
+                    if REORDER_AFTER_EACH_FILE:
+                        await request_reconcile(batch_id, force=False)
+                    return _release_processed(key, "ok")
                 else:
-                    _mark_item(batch_id, chat_id, msg_id,
-                               status_msg_id=None, slot_msg_id=None)
-                if REORDER_AFTER_EACH_FILE:
-                    await request_reconcile(batch_id, force=False)
-                return _release_processed(key, "ok")
-            else:
-                _log(
-                    f"📂 {full_link}: в me не найден — "
-                    f"переотправлю"
-                )
+                    _log(
+                        f"📂 {full_link}: в me не найден — "
+                        f"переотправлю"
+                    )
+
+            # downloaded или uploading (не найден) — ставим downloaded
+            st["status"] = "downloaded"
+            _mark_item(
+                batch_id, chat_id, msg_id,
+                status="downloaded",
+                file_size=os.path.getsize(filename),
+            )
+            await _update_status_msg(batch, key, full_link, force=True)
 
             st["status"] = "downloaded"
             _mark_item(
@@ -2315,28 +2324,9 @@ async def resume_pending_queues():
                     }
                     link_states[key] = st
 
-                    existing_msg = None
-                    for field in ("status_msg_id", "slot_msg_id"):
-                        mid = it.get(field)
-                        if not mid:
-                            continue
-                        try:
-                            m = await client.get_messages("me", ids=mid)
-                            if m:
-                                existing_msg = m
-                                break
-                        except FloodWaitError as fwe:
-                            _log(
-                                f"  ⏳ #{qid} {it['link']}: FloodWait "
-                                f"{fwe.seconds}s при чтении статус-сообщения"
-                            )
-                            await asyncio.sleep(fwe.seconds)
-                        except Exception:
-                            pass
-
-                    if existing_msg is not None:
-                        status_msgs[key] = existing_msg
-                    elif it.get("status") in (
+                    # ПАТЧ U9: не восстанавливаем из старых id —
+                    # могли быть удалены. Создаём новый статус.
+                    if it.get("status") in (
                         "pending", "downloading", "downloaded", "uploading"
                     ):
                         try:
@@ -2531,7 +2521,46 @@ async def offer_send_downloaded():
             status_msgs: dict[tuple, any] = {}
             link_states: dict[tuple, dict] = {}
 
+            # ПАТЧ U9: удаляем ВСЕ старые status_msg_id/slot_msg_id пачкой,
+            # затем создаём статусы заново для downloaded/uploading.
+            # Старые сообщения могли быть удалены (тобой или reconcile) —
+            # edit на них молча падает, и статусов в чате нет.
+            old_ids: list[int] = []
             for it in q_items:
+                for k in ("status_msg_id", "slot_msg_id"):
+                    mid = it.get(k)
+                    if mid:
+                        old_ids.append(mid)
+            old_ids = list(dict.fromkeys(old_ids))
+
+            if old_ids:
+                try:
+                    await client.delete_messages("me", old_ids)
+                    _log(
+                        f"  🗑  #{qid}: удалено {len(old_ids)} "
+                        f"старых статусов"
+                    )
+                except FloodWaitError as fwe:
+                    _log(
+                        f"  ⏳ #{qid}: FloodWait {fwe.seconds}s при удалении "
+                        f"старых статусов"
+                    )
+                    await asyncio.sleep(fwe.seconds)
+                    try:
+                        await client.delete_messages("me", old_ids)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    _log(
+                        f"  ⚠️  #{qid}: не удалось удалить старые "
+                        f"({len(old_ids)}): {e}"
+                    )
+
+            # Обнуляем id и создаём новые статусы
+            for it in q_items:
+                it["status_msg_id"] = None
+                it["slot_msg_id"] = None
+
                 key = (it["chat_id"], it["msg_id"])
 
                 link_states[key] = {
@@ -2552,28 +2581,7 @@ async def offer_send_downloaded():
                     "file_size": it.get("file_size", 0) or 0,
                 }
 
-                mid = it.get("status_msg_id") or it.get("slot_msg_id")
-                if mid:
-                    try:
-                        m = await client.get_messages("me", ids=mid)
-                        if m:
-                            status_msgs[key] = m
-                    except FloodWaitError as fwe:
-                        _log(
-                            f"  ⏳ #{qid} {it['link']}: FloodWait "
-                            f"{fwe.seconds}s при чтении статус-сообщения"
-                        )
-                        await asyncio.sleep(fwe.seconds)
-                        try:
-                            m = await client.get_messages("me", ids=mid)
-                            if m:
-                                status_msgs[key] = m
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-                if key not in status_msgs and it.get("status") in (
+                if it.get("status") in (
                     "pending", "downloading", "downloaded", "uploading"
                 ):
                     try:
@@ -2661,25 +2669,18 @@ async def offer_send_downloaded():
             key = (it["chat_id"], it["msg_id"])
 
             if key not in b["status_msgs"]:
-                old_id = it.get("status_msg_id")
-                m = None
-                if old_id:
-                    try:
-                        m = await client.get_messages("me", ids=old_id)
-                    except Exception:
-                        m = None
-                if not m:
-                    try:
-                        m = await client.send_message(
-                            "me", f"⏳ {it['link']} (ожидание...)"
-                        )
-                        _mark_item(qid, it["chat_id"], it["msg_id"],
-                                   status_msg_id=m.id)
-                    except Exception as e:
-                        _log(f"  ⚠️  #{qid} {it['link']}: статус не создан: {e}")
-                        m = None
-                if m:
+                # ПАТЧ U9: пробуем старый id, но проверяем что он валиден
+                # (не MessageEmpty). Если edit упадёт — создаём новый.
+                # Проще: создаём новый сразу — старые уже удалены пачкой выше.
+                try:
+                    m = await client.send_message(
+                        "me", f"⏳ {it['link']} (ожидание...)"
+                    )
+                    _mark_item(qid, it["chat_id"], it["msg_id"],
+                               status_msg_id=m.id)
                     b["status_msgs"][key] = m
+                except Exception as e:
+                    _log(f"  ⚠️  #{qid} {it['link']}: статус не создан: {e}")
 
             b["link_states"].setdefault(key, {
                 "status": "downloaded",
