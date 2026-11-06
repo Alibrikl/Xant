@@ -2703,14 +2703,6 @@ async def offer_send_downloaded():
     print(f"  📤 Поставлено в очередь на отправку: {placed}")
     if failed:
         print(f"  ⚠️  Не удалось поставить: {len(failed)}")
-
-    for qid in {qid for qid, _ in items}:
-        if qid in batches:
-            try:
-                await request_reconcile(qid, force=True)
-            except Exception as e:
-                _log(f"  ⚠️  reconcile #{qid}: {e}")
-
     return failed
 
 
@@ -3239,7 +3231,50 @@ async def main():
                 f"downloaded-элементов (были ложные инкременты watchdog)"
             )
 
+    # ПАТЧ 9: реабилитируем fail-элементы, у которых файл есть на диске.
+    # Если fail из-за прошлой ошибки (ValueError и т.п.), но локальный файл
+    # цел — ставим downloaded, чтобы _upload_worker переотправил.
+    for qid in _list_queue_files():
+        q = _load_queue(qid)
+        if not q:
+            continue
+        revived = 0
+        for it in q.get("items", []):
+            if it.get("status") != "fail":
+                continue
+            lf = it.get("local_file")
+            if not lf:
+                # fail без local_file — файла нет, нечего восстанавливать
+                continue
+            full_path = os.path.join(DOWNLOAD_DIR, lf)
+            if not os.path.exists(full_path):
+                continue
+            expected = it.get("file_size", 0) or 0
+            try:
+                actual = os.path.getsize(full_path)
+            except Exception:
+                actual = 0
+            if expected > 0 and actual < expected:
+                # частичный файл — не восстанавливаем
+                _log(
+                    f"  ⚠️  #{qid} {lf}: fail, но файл частичный "
+                    f"({human_size(actual)} из {human_size(expected)}) — пропуск"
+                )
+                continue
+            it["status"] = "downloaded"
+            it["upload_retries"] = 0
+            it["file_message_id"] = None
+            revived += 1
+            _log(
+                f"  ♻️  #{qid} {lf}: fail → downloaded "
+                f"(файл цел, {human_size(actual)}) — переотправлю"
+            )
+        if revived:
+            queues[qid] = q
+            _save_queue(qid)
+
     scan = _scan_downloads()
+
     _print_scan_summary(scan)
 
     for qid, it, full in scan["own_partial"]:
