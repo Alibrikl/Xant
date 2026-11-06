@@ -394,6 +394,79 @@ def _list_queue_files() -> list[int]:
             ids.append(int(m.group(1)))
     return sorted(ids)
 
+def _recover_queues_from_downloads():
+    """
+    Восстанавливает JSON-очереди из файлов в downloads/, если JSON'ов нет
+    (или они повреждены/удалены), но файлы на диске есть.
+
+    Логика:
+      1. Собираем имена файлов, которые уже упомянуты в существующих JSON
+         (own_by_name) — их НЕ трогаем.
+      2. Для остальных файлов в downloads/ — создаём новую очередь,
+         status="downloaded", local_file=<имя>, file_size=<размер>.
+      3. Сохраняем JSON.
+
+    Возвращает (created_count, skipped_existing).
+    """
+    existing_names: set[str] = set()
+    for qid in _list_queue_files():
+        q = _load_queue(qid)
+        if not q:
+            continue
+        for it in q.get("items", []):
+            lf = it.get("local_file")
+            if lf:
+                existing_names.add(lf)
+
+    orphan_files: list[str] = []
+    if os.path.isdir(DOWNLOAD_DIR):
+        for name in os.listdir(DOWNLOAD_DIR):
+            full = os.path.join(DOWNLOAD_DIR, name)
+            if not os.path.isfile(full):
+                continue
+            if name in existing_names:
+                continue
+            orphan_files.append(name)
+
+    if not orphan_files:
+        return (0, len(existing_names))
+
+    # Определяем batch_id: max(existing) + 1 или 1, если очередей нет.
+    existing_ids = _list_queue_files()
+    batch_id = (max(existing_ids) + 1) if existing_ids else 1
+
+    # Восстанавливаем batch_counter, чтобы новые очереди не пересекались.
+    if batch_id > batch_counter["id"]:
+        batch_counter["id"] = batch_id
+
+    items: list[dict] = []
+    for idx, name in enumerate(orphan_files):
+        full = os.path.join(DOWNLOAD_DIR, name)
+        try:
+            size = os.path.getsize(full)
+        except Exception:
+            size = 0
+
+        items.append({
+            "chat_id": "me",
+            "msg_id": -idx,
+            "link": name,
+            "status": "downloaded",
+            "status_msg_id": None,
+            "slot_msg_id": None,
+            "file_message_id": None,
+            "local_file": name,
+            "downloaded_at": time.time(),
+            "file_size": size,
+        })
+
+    _create_queue(batch_id, items)
+    _log(
+        f"♻️  восстановлена очередь #{batch_id} из downloads/: "
+        f"{len(items)} файлов (orphan), пропущено (уже в JSON): "
+        f"{len(existing_names)}"
+    )
+    return (len(items), len(existing_names))
 
 def _scan_downloads() -> dict:
     own_by_name: dict[str, tuple[int, dict]] = {}
@@ -3056,6 +3129,17 @@ async def main():
     if existing_ids:
         batch_counter["id"] = max(existing_ids)
         _log(f"🔢 batch_counter инициализирован: {batch_counter['id']}")
+
+    # ПАТЧ 8: если JSON-очередей нет (или файлы в downloads/ не упомянуты
+    # ни в одной), но файлы на диске есть — создаём JSON из downloads/.
+    # Это лечит случай, когда queues/ пуста, но downloads/ полна: без JSON
+    # reconcile_batch не работает, и статусы в чате не пересоздаются.
+    recovered, skipped = _recover_queues_from_downloads()
+    if recovered:
+        _log(
+            f"♻️  ПАТЧ 8: восстановлено файлов из downloads/ в JSON: "
+            f"{recovered} (пропущено, уже в JSON: {skipped})"
+        )
 
     # ПАТЧ 6: сбрасываем upload_retries у downloaded-элементов, чтобы старые
     # «попытки 1/3» от предыдущих watchdog-срабатываний не привели к fail.
