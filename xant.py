@@ -600,9 +600,23 @@ async def download_with_retry(
     attempt = 0
     while True:
         try:
-            return await client.download_media(
-                target_msg, file=local_path, progress_callback=progress_callback,
+            _log(
+                f"⬇️  download_media: {chat_id}/{msg_id} → "
+                f"{os.path.basename(local_path)} "
+                f"(размер={human_size(size_holder.get('size', 0) if size_holder else 0)})"
             )
+            result = await asyncio.wait_for(
+                client.download_media(
+                    target_msg, file=local_path,
+                    progress_callback=progress_callback,
+                ),
+                timeout=1800,  # 30 минут на файл
+            )
+            _log(
+                f"✅ download_media: {chat_id}/{msg_id} → "
+                f"{os.path.basename(local_path)} — готово"
+            )
+            return result
 
         except FileReferenceExpiredError:
             attempt += 1
