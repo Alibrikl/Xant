@@ -553,8 +553,23 @@ async def download_with_retry(
     size_holder: dict | None = None, max_retries: int = 3,
     on_path_known=None,
 ):
+    _log(f"[download] START {chat_id}/{msg_id}")
+
+    # ---------- 1. Получаем сообщение (с timeout 60s) ----------
+    target_msg = None
     try:
-        target_msg = await client.get_messages(chat_id, ids=msg_id)
+        _log(f"[download] get_messages {chat_id}/{msg_id}...")
+        target_msg = await asyncio.wait_for(
+            client.get_messages(chat_id, ids=msg_id),
+            timeout=60,
+        )
+        _log(
+            f"[download] get_messages {chat_id}/{msg_id}: "
+            f"{'есть медиа' if target_msg and target_msg.media else 'НЕТ медиа'}"
+        )
+    except asyncio.TimeoutError:
+        _log(f"[download] TIMEOUT get_messages {chat_id}/{msg_id} (60s)")
+        return None
     except ChannelPrivateError:
         print(
             f"\n[download] канал {chat_id} приватный или аккаунт "
@@ -564,7 +579,20 @@ async def download_with_retry(
     except FloodWaitError as fwe:
         print(f"\n[download] FloodWait {fwe.seconds}s при get_messages — жду")
         await asyncio.sleep(fwe.seconds)
-        target_msg = await client.get_messages(chat_id, ids=msg_id)
+        try:
+            target_msg = await client.get_messages(chat_id, ids=msg_id)
+        except ChannelPrivateError:
+            print(
+                f"\n[download] канал {chat_id} приватный — пропуск "
+                f"{chat_id}/{msg_id}"
+            )
+            return None
+        except Exception as e:
+            _log(f"[download] ошибка при перезапросе: {e}")
+            return None
+    except Exception as e:
+        _log(f"[download] ошибка get_messages: {type(e).__name__}: {e}")
+        return None
 
     if not target_msg or not target_msg.media:
         print(
@@ -573,6 +601,7 @@ async def download_with_retry(
         )
         return None
 
+    # ---------- 2. Размер и место на диске ----------
     if size_holder is not None:
         size_holder["size"] = target_msg.file.size if target_msg.file else 0
 
@@ -590,6 +619,7 @@ async def download_with_retry(
             except Exception as e:
                 print(f"[disk check] не удалось проверить место: {e}")
 
+    # ---------- 3. Путь ----------
     suggested_filename = build_filename(target_msg)
     local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
     if size_holder is not None:
@@ -597,20 +627,22 @@ async def download_with_retry(
     if on_path_known is not None:
         on_path_known(local_path)
 
+    # ---------- 4. Скачивание с retry ----------
     attempt = 0
     while True:
+        _log(
+            f"⬇️  download_media: {chat_id}/{msg_id} → "
+            f"{os.path.basename(local_path)} "
+            f"(размер={human_size(size_holder.get('size', 0) if size_holder else 0)})"
+        )
+
         try:
-            _log(
-                f"⬇️  download_media: {chat_id}/{msg_id} → "
-                f"{os.path.basename(local_path)} "
-                f"(размер={human_size(size_holder.get('size', 0) if size_holder else 0)})"
-            )
             result = await asyncio.wait_for(
                 client.download_media(
                     target_msg, file=local_path,
                     progress_callback=progress_callback,
                 ),
-                timeout=1800,  # 30 минут на файл
+                timeout=1800,
             )
             _log(
                 f"✅ download_media: {chat_id}/{msg_id} → "
@@ -618,13 +650,48 @@ async def download_with_retry(
             )
             return result
 
+        except asyncio.TimeoutError:
+            attempt += 1
+            _log(
+                f"[download] TIMEOUT download_media {chat_id}/{msg_id} "
+                f"(1800s, попытка {attempt}/{max_retries})"
+            )
+            _cleanup_partial(
+                local_path,
+                size_holder.get("size", 0) if size_holder else 0,
+            )
+            if attempt >= max_retries:
+                _log(f"[download] исчерпаны попытки — fail {chat_id}/{msg_id}")
+                return None
+            await asyncio.sleep(5)
+            try:
+                target_msg = await client.get_messages(
+                    chat_id, ids=msg_id, use_cache=False,
+                )
+            except Exception as e:
+                _log(f"[download] не удалось перезапросить target_msg: {e}")
+                return None
+            if not target_msg or not target_msg.media:
+                return None
+            continue
+
         except FileReferenceExpiredError:
             attempt += 1
             print(f"\n[Внимание] Ссылка устарела (попытка {attempt}). Перезапрашиваем...")
-            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
+            _cleanup_partial(
+                local_path,
+                size_holder.get("size", 0) if size_holder else 0,
+            )
             if attempt >= max_retries:
-                raise
-            target_msg = await client.get_messages(chat_id, ids=msg_id, use_cache=False)
+                _log("[download] исчерпаны попытки (FileRefExpired) — fail")
+                return None
+            try:
+                target_msg = await client.get_messages(
+                    chat_id, ids=msg_id, use_cache=False,
+                )
+            except Exception as e:
+                _log(f"[download] не удалось перезапросить target_msg: {e}")
+                return None
             if not target_msg or not target_msg.media:
                 return None
             if size_holder is not None:
@@ -653,11 +720,16 @@ async def download_with_retry(
                 size_holder["path"] = local_path
             if on_path_known is not None:
                 on_path_known(local_path)
+            continue
 
         except FloodWaitError as fwe:
-            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
+            _cleanup_partial(
+                local_path,
+                size_holder.get("size", 0) if size_holder else 0,
+            )
             print(f"\n[FloodWait] Ждём {fwe.seconds} сек...")
             await asyncio.sleep(fwe.seconds)
+            continue
 
         except Exception as e:
             attempt += 1
@@ -665,12 +737,18 @@ async def download_with_retry(
                 f"[download_with_retry] {type(e).__name__} "
                 f"(попытка {attempt}/{max_retries}): {e}"
             )
-            _cleanup_partial(local_path, size_holder.get("size", 0) if size_holder else 0)
+            _cleanup_partial(
+                local_path,
+                size_holder.get("size", 0) if size_holder else 0,
+            )
             if attempt >= max_retries:
-                raise e
+                _log(
+                    f"[download] исчерпаны попытки ({attempt}/{max_retries}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                return None
             await asyncio.sleep(2 * attempt)
-
-
+            
 # ---------- Метаданные ----------
 def _to_seconds(value) -> int:
     if value is None:
