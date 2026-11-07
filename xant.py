@@ -688,18 +688,32 @@ def _video_meta_sync(path: str):
 
 
 def _audio_meta_sync(path: str) -> int:
+    # ПАТЧ: сначала hachoir (mp3, m4a, flac — обычно ок).
     try:
         from hachoir.metadata import extractMetadata
         from hachoir.parser import createParser
         parser = createParser(path)
-        if not parser:
-            return 0
-        meta = extractMetadata(parser)
-        if not meta:
-            return 0
-        return _to_seconds(meta.get("duration"))
+        if parser:
+            meta = extractMetadata(parser)
+            if meta:
+                d = _to_seconds(meta.get("duration"))
+                if d > 0:
+                    return d
     except Exception:
-        return 0
+        pass
+
+    # ПАТЧ: fallback через mutagen (лучше для ogg/opus).
+    try:
+        from mutagen import File as MutagenFile
+        m = MutagenFile(path)
+        if m is not None and m.info is not None:
+            length = getattr(m.info, "length", None)
+            if length:
+                return int(float(length))
+    except Exception:
+        pass
+
+    return 0
 
 
 # ---------- Отправка медиа ----------
@@ -740,9 +754,43 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         )
     elif kind == "audio":
         d = await asyncio.to_thread(_audio_meta_sync, path)
+
+        # ПАТЧ: определяем voice по расширению.
+        # Telegram хранит voice в Ogg/Opus — .ogg и .opus считаем voice.
+        # Обычные аудио (.mp3, .m4a, .flac, .wav, .aac) — audio.
+        ext_lower = os.path.splitext(path)[1].lower()
+        voice_exts = {".ogg", ".opus"}
+        is_voice = ext_lower in voice_exts
+
+        try:
+            fsize = os.path.getsize(path)
+        except Exception:
+            fsize = 0
+
+        _log(
+            f"[_send_media] {os.path.basename(path)}: kind=audio, "
+            f"ext={ext_lower}, size={human_size(fsize)}, "
+            f"duration={d}, is_voice={is_voice}"
+        )
+
+        if is_voice:
+            import hashlib
+            waveform = hashlib.md5(
+                display_name.encode("utf-8")
+            ).digest()[:5]
+            attrs = [
+                DocumentAttributeAudio(
+                    duration=d,
+                    voice=True,
+                    waveform=waveform,
+                )
+            ]
+        else:
+            attrs = [DocumentAttributeAudio(duration=d), name_attr]
+
         return await client.send_file(
             chat, path,
-            attributes=[DocumentAttributeAudio(duration=d), name_attr],
+            attributes=attrs,
             progress_callback=progress_cb,
         )
     else:
