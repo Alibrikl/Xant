@@ -889,12 +889,17 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
                     waveform=waveform,
                 )
             ]
+            # ПАТЧ: для voice Telegram требует audio/ogg + Opus внутри.
+            # Явно указываем mime_type, чтобы Telethon не угадывал.
+            mime = "audio/ogg"
         else:
             attrs = [DocumentAttributeAudio(duration=d), name_attr]
+            mime = "audio/ogg"
 
         return await client.send_file(
             chat, path,
             attributes=attrs,
+            mime_type=mime,
             progress_callback=progress_cb,
             caption=caption,
         )
