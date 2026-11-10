@@ -436,6 +436,10 @@ def _recover_queues_from_downloads():
         for name in os.listdir(DOWNLOAD_DIR):
             if name.endswith(".part"):
                 continue
+            # ПАТЧ: пропускаем временные voice_opus-файлы
+            # (могут остаться, если процесс был убит во время перекодирования)
+            if ".voice_opus_" in name:
+                continue
             full = os.path.join(DOWNLOAD_DIR, name)
             if not os.path.isfile(full):
                 continue
@@ -821,6 +825,125 @@ def _audio_meta_sync(path: str) -> int:
     return 0
 
 
+async def _ensure_opus(path: str) -> str | None:
+    """
+    ПАТЧ: проверяет кодек .ogg/.opus через ffprobe.
+    Если кодек НЕ opus (например, vorbis) — перекодирует во временный
+    Ogg/Opus файл через ffmpeg (libopus, 32k, 48kHz, mono) и возвращает
+    путь к нему. Если кодек уже opus — возвращает None (перекодирование
+    не нужно). Если ffmpeg/ffprobe нет или ошибка — возвращает None
+    (отправляем как есть).
+
+    Требует: ffmpeg + ffprobe в PATH (Termux: pkg install ffmpeg).
+    """
+    if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
+        _log("  ⚠️  _ensure_opus: ffprobe/ffmpeg не найдены — пропускаю")
+        return None
+
+    # ---------- 1. Определяем кодек ----------
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+
+        if proc.returncode != 0:
+            _log(
+                f"  ⚠️  _ensure_opus: ffprobe вернул {proc.returncode}: "
+                f"{stderr.decode('utf-8', errors='ignore')[:200]}"
+            )
+            return None
+
+        codec = stdout.decode("utf-8", errors="ignore").strip().lower()
+        _log(f"  🔍 _ensure_opus: {os.path.basename(path)} кодек={codec or '?'}")
+
+        if codec == "opus":
+            return None  # уже Opus — ничего не делаем
+
+    except asyncio.TimeoutError:
+        _log("  ⚠️  _ensure_opus: ffprobe timeout — убиваю процесс")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        _log(f"  ⚠️  _ensure_opus: ffprobe {type(e).__name__}: {e}")
+        return None
+
+    # ---------- 2. Перекодируем в Opus ----------
+    tmp = path + f".voice_opus_{int(time.time())}.ogg"
+    _log(f"  🔄 _ensure_opus: перекодирую {os.path.basename(path)} ({codec}) → Opus")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", path,
+            "-c:a", "libopus",
+            "-b:a", "32k",
+            "-ar", "48000",
+            "-ac", "1",
+            "-f", "ogg",
+            tmp,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            _log(
+                f"  ⚠️  _ensure_opus: ffmpeg вернул {proc.returncode}: "
+                f"{stderr.decode('utf-8', errors='ignore')[:300]}"
+            )
+            _safe_remove(tmp)
+            return None
+
+        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            _log("  ⚠️  _ensure_opus: ffmpeg создал пустой файл — откат")
+            _safe_remove(tmp)
+            return None
+
+        _log(
+            f"  ✅ _ensure_opus: готово → {os.path.basename(tmp)} "
+            f"({human_size(os.path.getsize(tmp))})"
+        )
+        return tmp
+
+    except asyncio.TimeoutError:
+        _log("  ⚠️  _ensure_opus: ffmpeg timeout (300s) — убиваю процесс")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        _safe_remove(tmp)
+        return None
+    except Exception as e:
+        _log(f"  ⚠️  _ensure_opus: ffmpeg {type(e).__name__}: {e}")
+        _safe_remove(tmp)
+        return None
+
+
+def _safe_remove(path: str):
+    """Тихо удаляет файл, если он есть."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+    
 # ---------- Отправка медиа ----------
 def _get_send_kind(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
@@ -857,6 +980,7 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             caption=caption,
             progress_callback=progress_cb,
         )
+    
     elif kind == "audio":
         d = await asyncio.to_thread(_audio_meta_sync, path)
 
@@ -878,39 +1002,44 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             f"duration={d}, is_voice={is_voice}"
         )
 
+        # ПАТЧ: для voice Telegram требует Ogg/Opus внутри.
+        # Если кодек не Opus (например, Vorbis) — перекодируем на лету
+        # во временный Opus-файл. Если ffmpeg нет — отправим как есть.
+        tmp_opus: str | None = None
+        send_path = path
         if is_voice:
-            waveform = hashlib.md5(
-                display_name.encode("utf-8")
-            ).digest()[:5]
-            attrs = [
-                DocumentAttributeAudio(
-                    duration=d,
-                    voice=True,
-                    waveform=waveform,
-                )
-            ]
-            # ПАТЧ: для voice Telegram требует audio/ogg + Opus внутри.
-            # Явно указываем mime_type, чтобы Telethon не угадывал.
-            mime = "audio/ogg"
-        else:
-            attrs = [DocumentAttributeAudio(duration=d), name_attr]
-            mime = "audio/ogg"
+            tmp_opus = await _ensure_opus(path)
+            if tmp_opus:
+                send_path = tmp_opus
 
-        return await client.send_file(
-            chat, path,
-            attributes=attrs,
-            mime_type=mime,
-            progress_callback=progress_cb,
-            caption=caption,
-        )
-    else:
-        return await client.send_file(
-            chat, path,
-            force_document=True,
-            attributes=[name_attr],
-            progress_callback=progress_cb,
-            caption=caption,
-        )
+        try:
+            if is_voice:
+                waveform = hashlib.md5(
+                    display_name.encode("utf-8")
+                ).digest()[:5]
+                attrs = [
+                    DocumentAttributeAudio(
+                        duration=d,
+                        voice=True,
+                        waveform=waveform,
+                    )
+                ]
+                mime = "audio/ogg"
+            else:
+                attrs = [DocumentAttributeAudio(duration=d), name_attr]
+                mime = "audio/ogg"
+
+            return await client.send_file(
+                chat, send_path,
+                attributes=attrs,
+                mime_type=mime,
+                progress_callback=progress_cb,
+                caption=caption,
+            )
+        finally:
+            # Удаляем временный Opus-файл после отправки
+            if tmp_opus:
+                _safe_remove(tmp_opus)
 
 
 # ---------- Статусы ----------
@@ -1467,7 +1596,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             else:
                 _cleanup_partial(fallback_path, expected)
                 _mark_item(batch_id, chat_id, msg_id,
-                           status="fail", local_file=None)
+                           status="fail", local_file=None, next_retry_ts=0)
                 st["status"] = "fail"
                 _log(
                     f"🗑  {full_link}: частичный файл "
@@ -1475,7 +1604,7 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     f"удалён — fail"
                 )
         else:
-            _mark_item(batch_id, chat_id, msg_id, status="fail")
+            _mark_item(batch_id, chat_id, msg_id, status="fail", next_retry_ts=0)
             st["status"] = "fail"
 
         await _update_status_msg(batch, key, full_link, force=True)
@@ -1675,7 +1804,7 @@ async def _upload_worker(worker_id: int = 0):
                     lf = it.get("local_file")
                     if not lf:
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                   status="fail", local_file=None)
+                                   status="fail", local_file=None, next_retry_ts=0)
                         b["fail"] = b.get("fail", 0) + 1
                         failed_missing = True
                         _log(
@@ -1686,7 +1815,7 @@ async def _upload_worker(worker_id: int = 0):
                     full_path = os.path.join(DOWNLOAD_DIR, lf)
                     if not os.path.exists(full_path):
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                   status="fail", local_file=None)
+                                   status="fail", local_file=None, next_retry_ts=0)
                         b["fail"] = b.get("fail", 0) + 1
                         failed_missing = True
                         _log(
@@ -1769,12 +1898,12 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
         return "ok" if cur.get("status") == "done" else "fail"
 
     if not local_name:
-        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        _mark_item(batch_id, chat_id, msg_id, status="fail", next_retry_ts=0)
         return "fail"
 
     filename = os.path.join(DOWNLOAD_DIR, local_name)
     if not os.path.exists(filename):
-        _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None)
+        _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None, next_retry_ts=0)
         _log(f"❌ upload-воркер: {full_link}: файл пропал ({filename}) → fail")
         return "fail"
 
@@ -1931,7 +2060,7 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             return "deferred"
         else:
             _cleanup_partial(filename, file_size)
-            _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None)
+            _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None, next_retry_ts=0)
             st["status"] = "fail"
             await _update_status_msg(batch, key, full_link, force=True)
             return "fail"
@@ -2033,14 +2162,14 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                         if not local or not os.path.exists(
                                 os.path.join(DOWNLOAD_DIR, local)):
                             _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                       status="fail", local_file=None)
+                                       status="fail", local_file=None, next_retry_ts=0)
                             b["fail"] = b.get("fail", 0) + 1
                             _log(f"  🐕 #{batch_id} {it['link']}: файл пропал → fail")
                             continue
                         retries = it.get("upload_retries", 0)
                         if retries >= 3:
                             _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                       status="fail", local_file=None)
+                                       status="fail", local_file=None, next_retry_ts=0)
                             b["fail"] = b.get("fail", 0) + 1
                             _log(
                                 f"  🐕 #{batch_id} {it['link']}: "
@@ -2154,7 +2283,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             _mark_item(
                                 batch_id, it["chat_id"], it["msg_id"],
                                 status="fail", local_file=None,
-                                upload_retries=3,
+                                upload_retries=3, next_retry_ts=0,
                             )
                             b["fail"] = b.get("fail", 0) + 1
                             any_fail = True
@@ -2191,7 +2320,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             _mark_item(
                                 batch_id, it["chat_id"], it["msg_id"],
                                 status="fail", local_file=None,
-                                upload_retries=3,
+                                upload_retries=3, next_retry_ts=0,
                             )
                             b["fail"] = b.get("fail", 0) + 1
                             any_fail = True
@@ -2207,7 +2336,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                             continue
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
                                    status="fail", local_file=None,
-                                   upload_retries=3)
+                                   upload_retries=3, next_retry_ts=0)
                         b["fail"] = b.get("fail", 0) + 1
                         any_fail = True
                         _log(f"  🐕 #{batch_id} {it['link']}: файл пропал → fail")
@@ -2216,7 +2345,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                     retries = cur.get("upload_retries", 0)
                     if retries >= 3:
                         _mark_item(batch_id, it["chat_id"], it["msg_id"],
-                                   status="fail", local_file=None)
+                                   status="fail", local_file=None, next_retry_ts=0)
                         b["fail"] = b.get("fail", 0) + 1
                         any_fail = True
                         _log(
@@ -2868,7 +2997,8 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
 
     if not os.path.exists(path):
         _log(f"⚠️  manual-файл пропал: {path} → fail")
-        _mark_item(batch_id, chat_id, msg_id, status="fail")
+        _mark_item(batch_id, chat_id, msg_id,
+                   status="fail", next_retry_ts=0)
         st["status"] = "fail"
         raise FileNotFoundError(path)
 
@@ -3027,7 +3157,7 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
                 b["fail"] += 1
     except Exception as e:
         _log(f"❌  Файл {os.path.basename(path)}: {type(e).__name__}: {e}")
-        _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail")
+        _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail", next_retry_ts=0)
         b = batches.get(batch_id)
         if b is not None:
             b["fail"] += 1
