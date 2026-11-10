@@ -45,6 +45,10 @@ REORDER_DEBOUNCE = 3.0
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".oga"}
+PHOTO_EXTS = {
+    ".jpg", ".jpeg", ".jpe", ".png", ".webp",
+    ".bmp", ".tif", ".tiff", ".heic", ".heif",
+}
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -421,7 +425,16 @@ def _find_cache_put(key, value):
 
 
 async def _find_in_me(display_name: str, file_size: int | None,
-                      scan_limit: int = 400, max_retries: int = 2) -> int | None:
+    scan_limit: int = 400, max_retries: int = 2) -> int | None:
+    # ПАТЧ: для фото поиск по имени не работает (file.name=None).
+    # Возвращаем None — фото отправится, дубли возможны, но не сломается.
+    _ext = os.path.splitext(display_name)[1].lower()
+    if _ext in PHOTO_EXTS:
+        _log(
+            f"  🔍 _find_in_me({display_name}): фото — "
+            f"поиск по имени не поддерживается, не кэширую"
+        )
+        return None
     if not display_name:
         return None
 
@@ -432,16 +445,24 @@ async def _find_in_me(display_name: str, file_size: int | None,
     if cached is not None:
         try:
             m = await client.get_messages("me", ids=cached)
-            matched = (
-                m is not None
-                and not isinstance(m, types.MessageEmpty)
-                and getattr(m, "file", None) is not None
-                and m.file.name == display_name
-                and (
-                    not check_size
-                    or (getattr(m.file, "size", 0) or 0) == file_size
-                )
-            )
+            matched = False
+            if m is not None and not isinstance(m, types.MessageEmpty):
+                if getattr(m, "photo", None) is not None:
+                    # ПАТЧ: фото — у него нет file.name, сравниваем по размеру.
+                    # MessageMediaPhoto → m.file.size = размер фотографии.
+                    size_ok = (
+                        not check_size
+                        or (getattr(m.file, "size", 0) or 0) == file_size
+                    )
+                    if size_ok:
+                        matched = True
+                elif getattr(m, "file", None) is not None:
+                    # Документ/аудио/видео — сравниваем по имени + размеру.
+                    if m.file.name == display_name and (
+                        not check_size
+                        or (getattr(m.file, "size", 0) or 0) == file_size
+                    ):
+                        matched = True
             if matched:
                 _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
                 return cached
@@ -454,16 +475,24 @@ async def _find_in_me(display_name: str, file_size: int | None,
         try:
             found: int | None = None
             async for msg in client.iter_messages("me", limit=scan_limit):
-                if not getattr(msg, "file", None):
-                    continue
-                if msg.file.name != display_name:
-                    continue
-                if check_size:
-                    size = getattr(msg.file, "size", 0) or 0
-                    if size != file_size:
+                if getattr(msg, "photo", None) is not None:
+                    # ПАТЧ: фото — сравниваем только по размеру.
+                    if check_size:
+                        size = getattr(msg.file, "size", 0) or 0
+                        if size != file_size:
+                            continue
+                    found = msg.id
+                    break
+                elif getattr(msg, "file", None) is not None:
+                    # Документ/аудио/видео.
+                    if msg.file.name != display_name:
                         continue
-                found = msg.id
-                break
+                    if check_size:
+                        size = getattr(msg.file, "size", 0) or 0
+                        if size != file_size:
+                            continue
+                    found = msg.id
+                    break
 
             if found is not None:
                 _find_cache_put(cache_key, found)
@@ -1065,13 +1094,34 @@ def _get_send_kind(path: str) -> str:
         return "video"
     if ext in AUDIO_EXTS:
         return "audio"
+    if ext in PHOTO_EXTS:
+        return "photo"
     return "document"
-
 
 async def _send_media(chat, path: str, display_name: str, progress_cb=None,
                       caption: str | None = None):
     kind = _get_send_kind(path)
     name_attr = DocumentAttributeFilename(display_name)
+
+    if kind == "photo":
+        _log(
+            f"[_send_media] {display_name}: kind=photo, "
+            f"отправляю как фото"
+        )
+        result = await client.send_file(
+            chat, path,
+            caption=caption,
+            progress_callback=progress_cb,
+        )
+        _log(
+            f"[_send_media] {display_name}: send_file вернул "
+            f"type={type(result).__name__!r}, id={getattr(result, 'id', None)!r}"
+        )
+        if result is None:
+            raise RuntimeError(
+                f"_send_media: send_file вернул None для {display_name} (kind=photo)"
+            )
+        return result
 
     if kind == "video":
         d, w, h = await asyncio.to_thread(_video_meta_sync, path)
@@ -1094,7 +1144,7 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             caption=caption,
             progress_callback=progress_cb,
         )
-    
+
     elif kind == "audio":
         d = await asyncio.to_thread(_audio_meta_sync, path)
 
@@ -1105,14 +1155,12 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         except Exception:
             fsize = 0
 
-        # ПАТЧ: ВСЕ аудио (включая .ogg/.opus/.oga) — всегда audio.
         _log(
             f"[_send_media] {os.path.basename(path)}: kind=audio, "
             f"ext={ext_lower}, size={human_size(fsize)}, "
             f"duration={d}"
         )
 
-        # ПАТЧ: mime по расширению (а не всегда audio/ogg)
         _MIME_BY_EXT = {
             ".mp3": "audio/mpeg",
             ".m4a": "audio/mp4",
@@ -1125,18 +1173,14 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         }
         mime = _MIME_BY_EXT.get(ext_lower, "audio/mpeg")
 
-        # ПАТЧ: title/performer из тегов, иначе — из имени файла
         title, performer = await asyncio.to_thread(_audio_tags_sync, path)
 
-        # Fallback: если тегов нет — берём из имени файла без расширения.
-        # Это лучше, чем «Unknown artist» в Telegram.
         if not title:
             base_no_ext = os.path.splitext(display_name)[0]
             title = base_no_ext or None
         if not performer:
-            performer = None  # оставляем None — Telegram покажет «Unknown»
+            performer = None
 
-        # Ограничиваем длину: Telegram отклоняет слишком длинные метаданные
         if title:
             title = title[:128]
         if performer:
@@ -1160,6 +1204,33 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             caption=caption,
         )
 
+    # ПАТЧ: document (PDF, ZIP, DOCX и т.д.) — отправляем как документ.
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".gif":
+        # GIF — как анимация (Telethon сам распознаёт по расширению).
+        _log(f"[_send_media] {display_name}: gif → как анимация")
+        result = await client.send_file(
+            chat, path,
+            caption=caption,
+            progress_callback=progress_cb,
+        )
+    else:
+        _log(f"[_send_media] {display_name}: document → force_document=True")
+        result = await client.send_file(
+            chat, path,
+            force_document=True,
+            attributes=[name_attr],
+            caption=caption,
+            progress_callback=progress_cb,
+        )
+    # ПАТЧ: если Telethon вернул None (что не должен) — явно бросаем.
+    if result is None:
+        raise RuntimeError(
+            f"_send_media: send_file вернул None для {display_name} "
+            f"(kind={kind})"
+        )
+    return result
+    
 
 # ---------- Статусы ----------
 def _render_status(st: dict, full_link: str,
@@ -2025,6 +2096,9 @@ async def _upload_worker(worker_id: int = 0):
                         )
                 finally:
                     b.get("_uploading", set()).discard(key)
+                    # ПАТЧ: после снятия _uploading проверяем завершение batch —
+                    # иначе batch закроется только на следующем тике (через 1 сек)
+                    await _maybe_finish_batch(batch_id)
 
         except asyncio.CancelledError:
             return
@@ -2083,23 +2157,35 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
     # ПАТЧ U7: проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
     # Если да — НЕ ставим uploading (📤 не мигнёт), сразу done + ✅.
-    try:
-        found_id = await _find_in_me(
-            display_name=display_name,
-            file_size=file_size,
-        )
-    except FloodWaitError:
-        _log(
-            f"⚠️  upload-воркер: {full_link}: FloodWait при проверке me — "
-            f"продолжаю отправку"
-        )
+    # ПАТЧ: для фото _find_in_me не работает (нет file.name) — пропускаем.
+    _is_photo = display_name.lower().endswith(
+        (".jpg", ".jpeg", ".jpe", ".png", ".webp", ".bmp",
+         ".tif", ".tiff", ".heic", ".heif")
+    )
+    if _is_photo:
         found_id = None
-    except Exception as e:
         _log(
-            f"⚠️  upload-воркер: {full_link}: ошибка проверки me "
-            f"({type(e).__name__}: {e}) — продолжаю отправку"
+            f"  🔍 upload-воркер: {full_link}: фото — "
+            f"проверку me пропускаю, отправляю"
         )
-        found_id = None
+    else:
+        try:
+            found_id = await _find_in_me(
+                display_name=display_name,
+                file_size=file_size,
+            )
+        except FloodWaitError:
+            _log(
+                f"⚠️  upload-воркер: {full_link}: FloodWait при проверке me — "
+                f"продолжаю отправку"
+            )
+            found_id = None
+        except Exception as e:
+            _log(
+                f"⚠️  upload-воркер: {full_link}: ошибка проверки me "
+                f"({type(e).__name__}: {e}) — продолжаю отправку"
+            )
+            found_id = None
 
     if found_id is not None:
         _log(
@@ -2191,6 +2277,9 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     kind = _get_send_kind(filename)
     if kind == "video":
         caption = f"🎬 {display_name}"
+    elif kind == "photo":
+        # ПАТЧ: для фото — caption с именем (опционально, можно убрать).
+        caption = f"🖼️ {display_name}"
     # ПАТЧ: для .ogg/.opus/.oga caption НЕ ставим здесь —
     # _send_media сам решит: voice (короткий) или audio (длинный).
     elif kind == "document":
@@ -2247,6 +2336,23 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
     sent_msg = sent[0] if isinstance(sent, list) else sent
     sent_id = getattr(sent_msg, "id", None)
+
+    # ПАТЧ: если send_file вернул None (например, document без ветки в
+    # _send_media) — считаем отправку неуспешной, не удаляем файл,
+    # не помечаем done. Иначе файл теряется.
+    if sent_id is None:
+        _log(
+            f"❌ upload-воркер: {full_link}: send_file вернул "
+            f"id=None (sent={sent!r}) — fail, файл оставляю"
+        )
+        _mark_item(
+            batch_id, chat_id, msg_id,
+            status="fail",
+            next_retry_ts=0,
+        )
+        st["status"] = "fail"
+        await _update_status_msg(batch, key, full_link, force=True)
+        return "fail"
 
     # ПАТЧ: batch отменили, пока файл летел — удаляем только что залитое
     if batch.get("cancelled"):
@@ -3304,6 +3410,9 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     kind = _get_send_kind(path)
     if kind == "video":
         manual_caption = f"🎬 {display_name}"
+    elif kind == "photo":
+        # ПАТЧ: для фото — caption с именем.
+        manual_caption = f"🖼️ {display_name}"
     elif kind == "document":
         manual_caption = f"📎 {display_name}"
 
