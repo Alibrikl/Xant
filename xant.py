@@ -42,7 +42,14 @@ REORDER_AFTER_EACH_FILE = True
 REORDER_DEBOUNCE = 3.0
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
-AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"}
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".oga"}
+
+# ПАТЧ: voice только для коротких/маленьких .ogg/.opus.
+# Всё, что длиннее / больше — отправляется как audio (с плеером),
+# а не как voice (кружок с волной). Telegram сам ограничивает voice,
+# но лучше решать это явно, чтобы не было сюрпризов.
+MAX_VOICE_DURATION_SEC = 3600          # 1 час
+MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -212,6 +219,7 @@ def _detect_kind(message) -> str:
 
 def build_filename(message) -> str:
     original = message.file.name if message.file and message.file.name else None
+    _log(f"[build_filename] id={message.id} name={original!r} kind={_detect_kind(message)}")
     if original:
         base, ext = os.path.splitext(original)
         base = _sanitize(base) or "file"
@@ -984,33 +992,47 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
     elif kind == "audio":
         d = await asyncio.to_thread(_audio_meta_sync, path)
 
-        # ПАТЧ: определяем voice по расширению.
-        # Telegram хранит voice в Ogg/Opus — .ogg и .opus считаем voice.
-        # Обычные аудио (.mp3, .m4a, .flac, .wav, .aac) — audio.
         ext_lower = os.path.splitext(path)[1].lower()
-        voice_exts = {".ogg", ".opus"}
-        is_voice = ext_lower in voice_exts
+        voice_exts = {".ogg", ".opus", ".oga"}
+        is_voice_ext = ext_lower in voice_exts
 
         try:
             fsize = os.path.getsize(path)
         except Exception:
             fsize = 0
 
-        _log(
-            f"[_send_media] {os.path.basename(path)}: kind=audio, "
-            f"ext={ext_lower}, size={human_size(fsize)}, "
-            f"duration={d}, is_voice={is_voice}"
-        )
-
-        # ПАТЧ: для voice Telegram требует Ogg/Opus внутри.
-        # Если кодек не Opus (например, Vorbis) — перекодируем на лету
-        # во временный Opus-файл. Если ffmpeg нет — отправим как есть.
+        # ПАТЧ: для .ogg/.opus/.oga всегда проверяем кодек и при необходимости
+        # перекодируем в Opus — даже если файл длинный (audio). Opus — валидный
+        # кодек для audio, Telegram его примет как audio с плеером.
         tmp_opus: str | None = None
         send_path = path
-        if is_voice:
+        if is_voice_ext:
             tmp_opus = await _ensure_opus(path)
             if tmp_opus:
                 send_path = tmp_opus
+                # ПАТЧ: после перекодирования пересчитаем размер и длительность
+                try:
+                    fsize = os.path.getsize(send_path)
+                except Exception:
+                    pass
+                d = await asyncio.to_thread(_audio_meta_sync, send_path)
+
+        # ПАТЧ: voice только если это .ogg/.opus/.oga И файл короткий/маленький.
+        # Длинные/большие — отправляем как audio (с плеером), а не voice.
+        is_short_enough = (
+            d > 0
+            and d <= MAX_VOICE_DURATION_SEC
+            and fsize > 0
+            and fsize <= MAX_VOICE_SIZE_BYTES
+        )
+        is_voice = is_voice_ext and is_short_enough
+
+        _log(
+            f"[_send_media] {os.path.basename(path)}: kind=audio, "
+            f"ext={ext_lower}, size={human_size(fsize)}, "
+            f"duration={d}, is_voice_ext={is_voice_ext}, "
+            f"is_short_enough={is_short_enough}, is_voice={is_voice}"
+        )
 
         try:
             if is_voice:
@@ -1025,7 +1047,12 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
                     )
                 ]
                 mime = "audio/ogg"
+                # ПАТЧ: caption для voice (если не передан — 🎤)
+                if caption is None:
+                    caption = f"🎤 {display_name}"
             else:
+                # ПАТЧ: длинные .ogg/.opus/.oga и прочие аудио —
+                # как audio (с плеером), не voice.
                 attrs = [DocumentAttributeAudio(duration=d), name_attr]
                 mime = "audio/ogg"
 
@@ -2008,11 +2035,10 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
     caption = None
     kind = _get_send_kind(filename)
-    ext_lower = os.path.splitext(filename)[1].lower()
     if kind == "video":
         caption = f"🎬 {display_name}"
-    elif ext_lower in (".ogg", ".opus"):
-        caption = f"🎤 {display_name}"
+    # ПАТЧ: для .ogg/.opus/.oga caption НЕ ставим здесь —
+    # _send_media сам решит: voice (короткий) или audio (длинный).
     elif kind == "document":
         caption = f"📎 {display_name}"
 
@@ -3082,8 +3108,10 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     ext_lower = os.path.splitext(path)[1].lower()
     if kind == "video":
         manual_caption = f"🎬 {display_name}"
-    elif ext_lower in (".ogg", ".opus"):
-        manual_caption = f"🎤 {display_name}"
+    # ПАТЧ: для .ogg/.opus/.oga caption НЕ ставим здесь —
+    # _send_media сам решит: voice (короткий) или audio (длинный).
+    # Если voice — caption добавится в _send_media.
+    # Если audio — caption не нужен (аудиофайл с плеером).
     elif kind == "document":
         manual_caption = f"📎 {display_name}"
         
