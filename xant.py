@@ -2,11 +2,13 @@ import os
 import re
 import json
 import time
-import hashlib
 import asyncio
-import logging
 import mimetypes
 import shutil
+import sys
+import select
+import signal as _signal
+import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -21,7 +23,7 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeVideo,
 )
-
+logger = logging.getLogger("xant")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ENV_FILE = os.path.join(BASE_DIR, ".env")
@@ -43,13 +45,6 @@ REORDER_DEBOUNCE = 3.0
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".oga"}
-
-# ПАТЧ: voice только для коротких/маленьких .ogg/.opus.
-# Всё, что длиннее / больше — отправляется как audio (с плеером),
-# а не как voice (кружок с волной). Telegram сам ограничивает voice,
-# но лучше решать это явно, чтобы не было сюрпризов.
-MAX_VOICE_DURATION_SEC = 3600          # 1 час
-MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 if not os.path.exists(ENV_FILE):
     print("==================================================")
@@ -117,7 +112,9 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
                 await m.delete()
                 break
             except FloodWaitError as fwe:
-                print(f"\n[FloodWait] Пауза {fwe.seconds} сек. перед удалением...")
+                logger.warning(
+                    "[FloodWait] пауза %ss перед удалением", fwe.seconds,
+                )
                 await asyncio.sleep(fwe.seconds)
             except Exception:
                 break
@@ -130,11 +127,13 @@ def _schedule_delete(*messages, delay: float = CLEANUP_DELAY):
     return task
 
 
-_LOG_PREFIX = "[reconcile]"
-
-
-def _log(msg: str):
-    print(f"{_LOG_PREFIX} {msg}")
+def _log(msg: str, prefix: str | None = None, level: int = logging.INFO):
+    """
+    Совместимая обёртка. Все старые вызовы `_log("...")` работают.
+    `prefix` добавляется к сообщению (например, "[download]").
+    """
+    text = f"{prefix} {msg}" if prefix else msg
+    logger.log(level, text)
 
 
 def _queue_snapshot(q: dict) -> str:
@@ -153,7 +152,8 @@ def _queue_snapshot(q: dict) -> str:
     return ", ".join(parts)
 
 
-_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# ПАТЧ: добавлены C1-контролы (\x7f-\x9f) для Windows-совместимости
+_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 _MULTI_UNDERSCORE = re.compile(r'_+')
 _MAX_NAME_BYTES = 230
 
@@ -258,13 +258,27 @@ def build_filename(message) -> str:
     # 4. message.text (caption) — первая строка, если похоже на имя
     if not original and message.text:
         first_line = message.text.strip().split("\n")[0].strip()
-        # Похоже на имя: не URL, не пустое, длина 1-100, нет запрещённых символов
-        if (
+        # ПАТЧ: caption должен выглядеть как имя файла:
+        # - не URL, не пустое, длина 1-100
+        # - содержит точку (расширение) ИЛИ не содержит эмодзи/пробелов подряд
+        # - не содержит символов, которые обычно есть в обычном тексте
+        _looks_like_filename = (
             first_line
             and 1 <= len(first_line) <= 100
             and "http" not in first_line.lower()
             and "www." not in first_line.lower()
-        ):
+            and (
+                # есть расширение — точно имя файла
+                bool(re.search(r"\.[A-Za-z0-9]{1,8}$", first_line))
+                or (
+                    # или: короткое, без эмодзи, без множественных пробелов
+                    len(first_line) <= 60
+                    and not re.search(r"[\U0001F300-\U0001FAFF]", first_line)
+                    and "  " not in first_line
+                )
+            )
+        )
+        if _looks_like_filename:
             original = first_line
             source = "message.text"
 
@@ -303,27 +317,16 @@ def build_filename(message) -> str:
     if not ext:
         ext = _detect_extension(message) or ".bin"
 
-    # ПАТЧ: для voice/audio/record не добавляем _{id}, если имя уже осмысленное
-    is_audio_like = ext.lower() in {
-        ".ogg", ".opus", ".oga", ".mp3", ".m4a",
-        ".aac", ".flac", ".wav",
-    }
-    if is_audio_like and original:
-        # Имя уже есть — не добавляем _{id}
-        filename = f"{base}{ext}"
-    else:
-        # Fallback или видео/документ — добавляем _{id} для уникальности
-        filename = f"{base}_{message.id}{ext}"
 
+    filename = f"{base}{ext}"
     filename = _truncate_to_bytes(filename, _MAX_NAME_BYTES)
     return filename
-
 
 def unique_path(path: str) -> str:
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
-    reserve = 6
+    reserve = 8  # ПАТЧ: запас на "(99999)" + возможные вариации
     trimmed = _truncate_to_bytes(base, max(1, _MAX_NAME_BYTES - reserve))
     i = 1
     while os.path.exists(f"{trimmed} ({i}){ext}"):
@@ -341,6 +344,11 @@ def extract_all_links(text: str):
 
 
 def human_size(num: float) -> str:
+    # ПАТЧ: KB для маленьких значений
+    if num < 1024:
+        return f"{int(num)} B"
+    if num < 1024 ** 2:
+        return f"{num / 1024:.2f} KB"
     if num < 1024 ** 3:
         return f"{num / (1024 ** 2):.2f} MB"
     for unit in ("GB", "TB", "PB"):
@@ -426,7 +434,8 @@ async def _find_in_me(display_name: str, file_size: int | None,
             m = await client.get_messages("me", ids=cached)
             matched = (
                 m is not None
-                and m.file is not None
+                and not isinstance(m, types.MessageEmpty)
+                and getattr(m, "file", None) is not None
                 and m.file.name == display_name
                 and (
                     not check_size
@@ -445,7 +454,7 @@ async def _find_in_me(display_name: str, file_size: int | None,
         try:
             found: int | None = None
             async for msg in client.iter_messages("me", limit=scan_limit):
-                if not msg.file:
+                if not getattr(msg, "file", None):
                     continue
                 if msg.file.name != display_name:
                     continue
@@ -558,9 +567,13 @@ def _recover_queues_from_downloads():
         except Exception:
             size = 0
 
+        # ПАТЧ: уникальный msg_id, чтобы не конфликтовать с manual-очередями
+        # (batch_id * 1_000_000 + idx, отрицательный — чтобы не пересечься
+        # с реальными Telegram msg_id)
+        unique_mid = -(batch_id * 1_000_000 + idx)
         items.append({
             "chat_id": "me",
-            "msg_id": -idx,
+            "msg_id": unique_mid,
             "link": name,
             "status": "downloaded",
             "status_msg_id": None,
@@ -608,6 +621,17 @@ def _scan_downloads() -> dict:
         if not os.path.isfile(full):
             continue
 
+        # ПАТЧ: .part — всегда «частичный», независимо от JSON
+        if name.endswith(".part"):
+            base_name = name[:-5]  # без ".part"
+            entry = own_by_name.get(base_name) or own_by_name.get(name)
+            if entry is not None:
+                qid, it = entry
+                own_partial.append((qid, it, full))
+            else:
+                manual.append(full)
+            continue
+
         entry = own_by_name.get(name)
         if entry is None:
             manual.append(full)
@@ -621,9 +645,10 @@ def _scan_downloads() -> dict:
         elif status in ("downloaded", "uploading"):
             own_ready.append((qid, it, full))
         else:
-            print(
-                f"  ⚠️  файл {name}: статус «{status}» в JSON, "
-                f"но файл на диске — считаю manual"
+            logger.warning(
+                "файл %s: статус «%s» в JSON, но файл на диске — "
+                "считаю manual",
+                name, status,
             )
             anomalous_done.append((qid, it, full))
 
@@ -680,20 +705,24 @@ async def download_with_retry(
         _log(f"[download] TIMEOUT get_messages {chat_id}/{msg_id} (60s)")
         return None
     except ChannelPrivateError:
-        print(
-            f"\n[download] канал {chat_id} приватный или аккаунт "
-            f"не состоит в нём — пропуск {chat_id}/{msg_id}"
+        logger.warning(
+            "[download] канал %s приватный или аккаунт не состоит в нём — "
+            "пропуск %s/%s",
+            chat_id, chat_id, msg_id,
         )
         return None
     except FloodWaitError as fwe:
-        print(f"\n[download] FloodWait {fwe.seconds}s при get_messages — жду")
+        logger.warning(
+            "[download] FloodWait %ss при get_messages — жду",
+            fwe.seconds,
+        )
         await asyncio.sleep(fwe.seconds)
         try:
             target_msg = await client.get_messages(chat_id, ids=msg_id)
         except ChannelPrivateError:
-            print(
-                f"\n[download] канал {chat_id} приватный — пропуск "
-                f"{chat_id}/{msg_id}"
+            logger.warning(
+                "[download] канал %s приватный — пропуск %s/%s",
+                chat_id, chat_id, msg_id,
             )
             return None
         except Exception as e:
@@ -704,9 +733,10 @@ async def download_with_retry(
         return None
 
     if not target_msg or not target_msg.media:
-        print(
-            f"[download] сообщение {chat_id}/{msg_id} не найдено "
-            f"или не содержит медиа — пропуск"
+        logger.warning(
+            "[download] сообщение %s/%s не найдено или не содержит медиа — "
+            "пропуск",
+            chat_id, msg_id,
         )
         return None
 
@@ -719,20 +749,23 @@ async def download_with_retry(
                 free = shutil.disk_usage(DOWNLOAD_DIR).free
                 need = size_holder["size"] * 1.1
                 if free < need:
-                    print(
-                        f"\n[disk check] недостаточно места для "
-                        f"{chat_id}/{msg_id}: нужно {human_size(need)}, "
-                        f"свободно {human_size(free)} — пропуск"
+                    logger.warning(
+                        "[disk check] недостаточно места для %s/%s: "
+                        "нужно %s, свободно %s — пропуск",
+                        chat_id, msg_id, human_size(need), human_size(free),
                     )
                     return None
             except Exception as e:
-                print(f"[disk check] не удалось проверить место: {e}")
+                logger.warning("[disk check] не удалось проверить место: %s", e)
 
     # ---------- 3. Путь ----------
     suggested_filename = build_filename(target_msg)
     local_path = unique_path(os.path.join(DOWNLOAD_DIR, suggested_filename))
+    # ПАТЧ: скачиваем во временный .part, переименовываем только при успехе
+    part_path = local_path + ".part"
     if size_holder is not None:
         size_holder["path"] = local_path
+        size_holder["part_path"] = part_path
     if on_path_known is not None:
         on_path_known(local_path)
 
@@ -748,11 +781,59 @@ async def download_with_retry(
         try:
             result = await asyncio.wait_for(
                 client.download_media(
-                    target_msg, file=local_path,
+                    target_msg, file=part_path,
                     progress_callback=progress_callback,
                 ),
                 timeout=1800,
             )
+            # Атомарно переименовываем .part → финальное имя
+            if result and os.path.exists(part_path):
+                try:
+                    os.replace(part_path, local_path)
+                    result = local_path
+                except OSError as e:
+                    _log(
+                        f"[download] не удалось переименовать "
+                        f"{os.path.basename(part_path)} → "
+                        f"{os.path.basename(local_path)}: {e}"
+                    )
+                    _cleanup_partial(
+                        local_path,
+                        size_holder.get("size", 0) if size_holder else 0,
+                    )
+                    attempt += 1
+                    if attempt >= max_retries:
+                        return None
+                    await asyncio.sleep(2 * attempt)
+                    continue
+            # ПАТЧ: проверяем, что скачался весь файл
+            expected = size_holder.get("size", 0) if size_holder else 0
+            if expected > 0 and result and os.path.exists(result):
+                try:
+                    actual = os.path.getsize(result)
+                except Exception:
+                    actual = 0
+                if actual < expected:
+                    attempt += 1
+                    _log(
+                        f"[download] неполный файл {chat_id}/{msg_id}: "
+                        f"{human_size(actual)} из {human_size(expected)} "
+                        f"(попытка {attempt}/{max_retries})"
+                    )
+                    _cleanup_partial(result, expected)
+                    if attempt >= max_retries:
+                        return None
+                    await asyncio.sleep(2 * attempt)
+                    try:
+                        target_msg = await client.get_messages(
+                            chat_id, ids=msg_id, use_cache=False,
+                        )
+                    except Exception as e:
+                        _log(f"[download] не удалось перезапросить target_msg: {e}")
+                        return None
+                    if not target_msg or not target_msg.media:
+                        return None
+                    continue
             _log(
                 f"✅ download_media: {chat_id}/{msg_id} → "
                 f"{os.path.basename(local_path)} — готово"
@@ -786,7 +867,10 @@ async def download_with_retry(
 
         except FileReferenceExpiredError:
             attempt += 1
-            print(f"\n[Внимание] Ссылка устарела (попытка {attempt}). Перезапрашиваем...")
+            logger.warning(
+                "[download] ссылка устарела (попытка %s) — перезапрашиваю",
+                attempt,
+            )
             _cleanup_partial(
                 local_path,
                 size_holder.get("size", 0) if size_holder else 0,
@@ -825,8 +909,10 @@ async def download_with_retry(
                         f"но старый файл не удалён ({old_path}): {e}"
                     )
 
+            part_path = local_path + ".part"
             if size_holder is not None:
                 size_holder["path"] = local_path
+                size_holder["part_path"] = part_path
             if on_path_known is not None:
                 on_path_known(local_path)
             continue
@@ -836,15 +922,23 @@ async def download_with_retry(
                 local_path,
                 size_holder.get("size", 0) if size_holder else 0,
             )
-            print(f"\n[FloodWait] Ждём {fwe.seconds} сек...")
+            logger.warning("[FloodWait] ждём %ss", fwe.seconds)
             await asyncio.sleep(fwe.seconds)
             continue
 
+        except asyncio.CancelledError:
+            # ПАТЧ: чистим частичный файл при отмене
+            _cleanup_partial(
+                local_path,
+                size_holder.get("size", 0) if size_holder else 0,
+            )
+            raise
+
         except Exception as e:
             attempt += 1
-            print(
-                f"[download_with_retry] {type(e).__name__} "
-                f"(попытка {attempt}/{max_retries}): {e}"
+            logger.warning(
+                "[download_with_retry] %s (попытка %s/%s): %s",
+                type(e).__name__, attempt, max_retries, e,
             )
             _cleanup_partial(
                 local_path,
@@ -916,125 +1010,53 @@ def _audio_meta_sync(path: str) -> int:
 
     return 0
 
-
-async def _ensure_opus(path: str) -> str | None:
+def _audio_tags_sync(path: str) -> tuple[str | None, str | None]:
     """
-    ПАТЧ: проверяет кодек .ogg/.opus через ffprobe.
-    Если кодек НЕ opus (например, vorbis) — перекодирует во временный
-    Ogg/Opus файл через ffmpeg (libopus, 32k, 48kHz, mono) и возвращает
-    путь к нему. Если кодек уже opus — возвращает None (перекодирование
-    не нужно). Если ffmpeg/ffprobe нет или ошибка — возвращает None
-    (отправляем как есть).
-
-    Требует: ffmpeg + ffprobe в PATH (Termux: pkg install ffmpeg).
+    Возвращает (title, performer) из ID3/тегов файла.
+    Оба значения — str или None. Не бросает исключений.
     """
-    if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
-        _log("  ⚠️  _ensure_opus: ffprobe/ffmpeg не найдены — пропускаю")
-        return None
-
-    # ---------- 1. Определяем кодек ----------
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-show_entries", "stream=codec_name",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        from mutagen import File as MutagenFile
+        m = MutagenFile(path)
+        if m is None or m.tags is None:
+            return (None, None)
 
-        if proc.returncode != 0:
-            _log(
-                f"  ⚠️  _ensure_opus: ffprobe вернул {proc.returncode}: "
-                f"{stderr.decode('utf-8', errors='ignore')[:200]}"
-            )
+        tags = m.tags
+
+        def _get(*keys):
+            """mutagen tags — это dict-like; ключи различаются по формату."""
+            for k in keys:
+                try:
+                    v = tags.get(k)
+                except Exception:
+                    v = None
+                if not v:
+                    continue
+                # mutagen может вернуть список (ID3) или строку
+                if isinstance(v, (list, tuple)):
+                    if not v:
+                        continue
+                    v = v[0]
+                # ID3-объекты (TIT2, TPE1) — приводим к str
+                s = str(v).strip()
+                if s:
+                    return s
             return None
 
-        codec = stdout.decode("utf-8", errors="ignore").strip().lower()
-        _log(f"  🔍 _ensure_opus: {os.path.basename(path)} кодек={codec or '?'}")
-
-        if codec == "opus":
-            return None  # уже Opus — ничего не делаем
-
-    except asyncio.TimeoutError:
-        _log("  ⚠️  _ensure_opus: ffprobe timeout — убиваю процесс")
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            await proc.wait()
-        except Exception:
-            pass
-        return None
-    except Exception as e:
-        _log(f"  ⚠️  _ensure_opus: ffprobe {type(e).__name__}: {e}")
-        return None
-
-    # ---------- 2. Перекодируем в Opus ----------
-    tmp = path + f".voice_opus_{int(time.time())}.ogg"
-    _log(f"  🔄 _ensure_opus: перекодирую {os.path.basename(path)} ({codec}) → Opus")
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-i", path,
-            "-c:a", "libopus",
-            "-b:a", "32k",
-            "-ar", "48000",
-            "-ac", "1",
-            "-f", "ogg",
-            tmp,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # ID3 (mp3), MP4 (m4a), Vorbis (flac/ogg), ASF (wma)
+        title = _get(
+            "TIT2", "title",       # ID3 / Vorbis
+            "\xa9nam",             # MP4
+            "Title",               # ASF
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-
-        if proc.returncode != 0:
-            _log(
-                f"  ⚠️  _ensure_opus: ffmpeg вернул {proc.returncode}: "
-                f"{stderr.decode('utf-8', errors='ignore')[:300]}"
-            )
-            _safe_remove(tmp)
-            return None
-
-        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
-            _log("  ⚠️  _ensure_opus: ffmpeg создал пустой файл — откат")
-            _safe_remove(tmp)
-            return None
-
-        _log(
-            f"  ✅ _ensure_opus: готово → {os.path.basename(tmp)} "
-            f"({human_size(os.path.getsize(tmp))})"
+        performer = _get(
+            "TPE1", "artist",      # ID3 / Vorbis
+            "\xa9ART",             # MP4
+            "Author",              # ASF
         )
-        return tmp
-
-    except asyncio.TimeoutError:
-        _log("  ⚠️  _ensure_opus: ffmpeg timeout (300s) — убиваю процесс")
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            await proc.wait()
-        except Exception:
-            pass
-        _safe_remove(tmp)
-        return None
-    except Exception as e:
-        _log(f"  ⚠️  _ensure_opus: ffmpeg {type(e).__name__}: {e}")
-        _safe_remove(tmp)
-        return None
-
-
-def _safe_remove(path: str):
-    """Тихо удаляет файл, если он есть."""
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
+        return (title, performer)
     except Exception:
-        pass
+        return (None, None)
     
 # ---------- Отправка медиа ----------
 def _get_send_kind(path: str) -> str:
@@ -1077,80 +1099,66 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         d = await asyncio.to_thread(_audio_meta_sync, path)
 
         ext_lower = os.path.splitext(path)[1].lower()
-        voice_exts = {".ogg", ".opus", ".oga"}
-        is_voice_ext = ext_lower in voice_exts
 
         try:
             fsize = os.path.getsize(path)
         except Exception:
             fsize = 0
 
-        # ПАТЧ: для .ogg/.opus/.oga всегда проверяем кодек и при необходимости
-        # перекодируем в Opus — даже если файл длинный (audio). Opus — валидный
-        # кодек для audio, Telegram его примет как audio с плеером.
-        tmp_opus: str | None = None
-        send_path = path
-        if is_voice_ext:
-            tmp_opus = await _ensure_opus(path)
-            if tmp_opus:
-                send_path = tmp_opus
-                # ПАТЧ: после перекодирования пересчитаем размер и длительность
-                try:
-                    fsize = os.path.getsize(send_path)
-                except Exception:
-                    pass
-                d = await asyncio.to_thread(_audio_meta_sync, send_path)
-
-        # ПАТЧ: voice только если это .ogg/.opus/.oga И файл короткий/маленький.
-        # Длинные/большие — отправляем как audio (с плеером), а не voice.
-        is_short_enough = (
-            d > 0
-            and d <= MAX_VOICE_DURATION_SEC
-            and fsize > 0
-            and fsize <= MAX_VOICE_SIZE_BYTES
-        )
-        is_voice = is_voice_ext and is_short_enough
-
+        # ПАТЧ: ВСЕ аудио (включая .ogg/.opus/.oga) — всегда audio.
         _log(
             f"[_send_media] {os.path.basename(path)}: kind=audio, "
             f"ext={ext_lower}, size={human_size(fsize)}, "
-            f"duration={d}, is_voice_ext={is_voice_ext}, "
-            f"is_short_enough={is_short_enough}, is_voice={is_voice}"
+            f"duration={d}"
         )
 
-        try:
-            if is_voice:
-                waveform = hashlib.md5(
-                    display_name.encode("utf-8")
-                ).digest()[:5]
-                attrs = [
-                    DocumentAttributeAudio(
-                        duration=d,
-                        voice=True,
-                        waveform=waveform,
-                    )
-                ]
-                mime = "audio/ogg"
-                # ПАТЧ: caption для voice (если не передан — 🎤)
-                if caption is None:
-                    caption = f"🎤 {display_name}"
-            else:
-                # ПАТЧ: длинные .ogg/.opus/.oga и прочие аудио —
-                # как audio (с плеером), не voice.
-                attrs = [DocumentAttributeAudio(duration=d), name_attr]
-                mime = "audio/ogg"
+        # ПАТЧ: mime по расширению (а не всегда audio/ogg)
+        _MIME_BY_EXT = {
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".opus": "audio/ogg",
+        }
+        mime = _MIME_BY_EXT.get(ext_lower, "audio/mpeg")
 
-            return await client.send_file(
-                chat, send_path,
-                attributes=attrs,
-                mime_type=mime,
-                progress_callback=progress_cb,
-                caption=caption,
-            )
-        finally:
-            # Удаляем временный Opus-файл после отправки
-            if tmp_opus:
-                _safe_remove(tmp_opus)
+        # ПАТЧ: title/performer из тегов, иначе — из имени файла
+        title, performer = await asyncio.to_thread(_audio_tags_sync, path)
+
+        # Fallback: если тегов нет — берём из имени файла без расширения.
+        # Это лучше, чем «Unknown artist» в Telegram.
+        if not title:
+            base_no_ext = os.path.splitext(display_name)[0]
+            title = base_no_ext or None
+        if not performer:
+            performer = None  # оставляем None — Telegram покажет «Unknown»
+
+        # Ограничиваем длину: Telegram отклоняет слишком длинные метаданные
+        if title:
+            title = title[:128]
+        if performer:
+            performer = performer[:128]
+
+        attrs = [
+            DocumentAttributeAudio(
+                duration=d,
+                title=title,
+                performer=performer,
+                voice=False,
+            ),
+            name_attr,
+        ]
+
+        return await client.send_file(
+            chat, path,
+            attributes=attrs,
+            mime_type=mime,
+            progress_callback=progress_cb,
+            caption=caption,
+        )
 
 
 # ---------- Статусы ----------
@@ -1260,7 +1268,13 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
         except MessageNotModifiedError:
             pass
         except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds)
+            # ПАТЧ: логируем, чтобы видеть в тестах/проде
+            _log(
+                f"[flood] edit статуса {full_link}: {fwe.seconds}s — "
+                f"пропускаю обновление"
+            )
+            # НЕ спим здесь — статус не критичен, следующее обновление
+            # придёт через 3s throttle. Сон заблокировал бы воркер.
         except Exception:
             pass
 
@@ -1465,8 +1479,10 @@ async def request_reconcile(batch_id: int, force: bool = False):
         state["last"] = time.time()
         try:
             await reconcile_batch(batch_id, force=force)
-        except Exception as e:
-            print(f"[request_reconcile] Ошибка реконсиляции пачки {batch_id}: {e}")
+        except Exception:
+            logger.exception(
+                "[request_reconcile] ошибка реконсиляции пачки %s", batch_id,
+            )
         finally:
             state["running"] = False
 
@@ -1486,19 +1502,21 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
     if batch is None:
         return "fail"
 
+    # ПАТЧ: batch отменён через /clear — не качаем
+    if batch.get("cancelled"):
+        _log(f"⏭  {full_link}: batch отменён — пропуск")
+        return "fail"
+
     key = (chat_id, msg_id)
     if key in processed:
         return "deferred"
-    processed.add(key)
 
     st = batch["link_states"].get(key)
     if st is None:
-        _release_processed(key, "fail")
         return "fail"
 
     item = _find_item(batch_id, chat_id, msg_id)
     if item is None:
-        _release_processed(key, "fail")
         return "fail"
 
     if item.get("status") in ("done", "skip", "fail"):
@@ -1506,11 +1524,13 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             f"⏭  пропуск {full_link}: уже {item.get('status')} "
             f"(повторный process_link)"
         )
-        _release_processed(key, "deferred")
         return "deferred"
 
+    # ПАТЧ: processed.add — только после всех проверок
+    processed.add(key)
     filename = None
     size_holder = {"size": 0}
+    st["_last_logged_pct"] = -1
 
     _log(
         f"▶ начинаю {full_link} "
@@ -1526,7 +1546,9 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             st["percent"] = (current / total) * 100 if total else 0
             st["status"] = "downloading"
             cur_item = _find_item(batch_id, chat_id, msg_id)
-            if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
+            if cur_item is None:
+                return
+            if cur_item.get("status") in ("fail", "done", "skip"):
                 return
             path = size_holder.get("path")
             if path and not item.get("local_file"):
@@ -1535,6 +1557,18 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
                     status="downloading",
                     local_file=os.path.basename(path),
                 )
+
+            # ПАТЧ: прогресс в консоль, но не чаще, чем каждые 10%
+            pct = (current / total * 100) if total else 0
+            last_pct = st.get("_last_logged_pct", -1)
+            if pct - last_pct >= 10 or current == total:
+                st["_last_logged_pct"] = pct
+                logger.info(
+                    "⬇️  [download] %s: %.1f%% (%s / %s)",
+                    full_link, pct,
+                    human_size(current), human_size(total),
+                )
+
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
@@ -1653,6 +1687,13 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
         return "downloaded"
 
     except asyncio.CancelledError:
+        # ПАТЧ: сбрасываем в pending, чтобы при следующем запуске
+        # элемент был перекачан (а не остался в downloading)
+        try:
+            _mark_item(batch_id, chat_id, msg_id, status="pending")
+            st["status"] = "pending"
+        except Exception:
+            pass
         _release_processed(key, "fail")
         raise
 
@@ -1778,17 +1819,26 @@ async def _maybe_finish_batch(batch_id: int):
 
     q = queues.get(batch_id)
 
-    # ПАТЧ: пересчитываем счётчики из JSON — источник истины.
-    # Устраняет двойной инкремент ok/fail из _watchdog + _upload_worker.
     if q is not None:
         b["ok"] = sum(1 for it in q.get("items", []) if it.get("status") == "done")
         b["skip"] = sum(1 for it in q.get("items", []) if it.get("status") == "skip")
         b["fail"] = sum(1 for it in q.get("items", []) if it.get("status") == "fail")
+        # ПАТЧ: total = len(items) из JSON — источник истины
+        b["total"] = len(q.get("items", []))
 
     done = b["ok"] + b["skip"] + b["fail"]
     if done < b["total"]:
         return
     if b.get("finished"):
+        return
+
+    # ПАТЧ: не завершаем batch, пока есть активные upload-воркеры
+    if b.get("_uploading"):
+        _log(
+            f"batch #{batch_id}: счётчики сошлись, но "
+            f"{len(b['_uploading'])} upload-воркеров ещё работают — "
+            f"откладываю завершение"
+        )
         return
 
     if q is not None:
@@ -1992,6 +2042,11 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
     key = (chat_id, msg_id)
 
+    # ПАТЧ: batch отменён через /clear — не отправляем
+    if batch.get("cancelled"):
+        _log(f"  ⏭  upload-воркер: {full_link}: batch отменён — пропуск")
+        return "deferred"
+
     # ПАТЧ 4: если process_link уже взял элемент — НЕ отправляем параллельно.
     if key in processed:
         _log(
@@ -2098,6 +2153,7 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     st["up_total"] = file_size
     st["up_percent"] = 0.0
     st["last_up_cb"] = 0.0
+    st["_last_logged_pct"] = -1
     _mark_item(batch_id, chat_id, msg_id, status="uploading")
     await _update_status_msg(batch, key, full_link, force=True)
 
@@ -2111,9 +2167,23 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             st["up_total"] = total
             st["up_percent"] = (current / total) * 100 if total else 0
             cur_item = _find_item(batch_id, chat_id, msg_id)
-            if cur_item and cur_item.get("status") in ("fail", "done", "skip"):
+            if cur_item is None:
+                return
+            if cur_item.get("status") in ("fail", "done", "skip"):
                 return
             _mark_item(batch_id, chat_id, msg_id, status="uploading")
+
+            # ПАТЧ: прогресс в консоль, но не чаще, чем каждые 10%
+            pct = (current / total * 100) if total else 0
+            last_pct = st.get("_last_logged_pct", -1)
+            if pct - last_pct >= 10 or current == total:
+                st["_last_logged_pct"] = pct
+                logger.info(
+                    "📤 [upload] %s: %.1f%% (%s / %s)",
+                    display_name, pct,
+                    human_size(current), human_size(total),
+                )
+
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
@@ -2177,6 +2247,23 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
     sent_msg = sent[0] if isinstance(sent, list) else sent
     sent_id = getattr(sent_msg, "id", None)
+
+    # ПАТЧ: batch отменили, пока файл летел — удаляем только что залитое
+    if batch.get("cancelled"):
+        _log(
+            f"🛑 upload-воркер: {full_link}: batch отменён во время "
+            f"отправки — удаляю только что загруженное (id={sent_id})"
+        )
+        if sent_id:
+            try:
+                await client.delete_messages("me", [sent_id])
+            except Exception:
+                pass
+        try:
+            os.remove(filename)
+        except Exception:
+            pass
+        return "deferred"
 
     _log(
         f"✅ upload-воркер: файл загружен в «Избранное»: {full_link} "
@@ -2798,8 +2885,12 @@ async def resume_pending_queues():
 
 def _close_queue_if_finished(qid: int) -> bool:
     b = batches.get(qid)
-    if b is not None and not b.get("finished"):
-        return False
+    if b is not None:
+        if not b.get("finished"):
+            return False
+        # ПАТЧ: не удаляем JSON, пока есть активные upload-воркеры
+        if b.get("_uploading"):
+            return False
 
     q = queues.get(qid) or _load_queue(qid)
     if q is None:
@@ -2861,7 +2952,10 @@ async def offer_send_downloaded():
     if not items:
         return
 
-    print(f"\n📥 Найдено уже скачанных, но не отправленных файлов: {len(items)} — отправляю")
+    logger.info(
+        "📥 Найдено уже скачанных, но не отправленных файлов: %d — отправляю",
+        len(items),
+    )
 
     placed = 0
     failed: list[tuple[int, dict, str]] = []
@@ -2922,6 +3016,12 @@ async def offer_send_downloaded():
                 it["status_msg_id"] = None
                 it["slot_msg_id"] = None
 
+            # ПАТЧ: сохраняем сразу — если упадём при создании статусов,
+            # JSON не будет ссылаться на уже удалённые сообщения
+            queues[qid] = q
+            _save_queue(qid)
+
+            for it in q_items:
                 key = (it["chat_id"], it["msg_id"])
 
                 link_states[key] = {
@@ -3083,9 +3183,9 @@ async def offer_send_downloaded():
             )
             failed.append((qid, it, f"{type(e).__name__}: {e}"))
 
-    print(f"  📤 Поставлено в очередь на отправку: {placed}")
+    logger.info("📤 Поставлено в очередь на отправку: %d", placed)
     if failed:
-        print(f"  ⚠️  Не удалось поставить: {len(failed)}")
+        logger.warning("⚠️  Не удалось поставить: %d", len(failed))
     return failed
 
 
@@ -3174,6 +3274,7 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     st["up_total"] = file_size
     st["up_percent"] = 0.0
     st["last_up_cb"] = 0.0
+    st["_last_logged_pct"] = -1
     _mark_item(batch_id, chat_id, msg_id, status="uploading")
     await _update_status_msg(batch, key, full_link, force=True)
 
@@ -3184,24 +3285,28 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
             st["up_current"] = current
             st["up_total"] = total
             st["up_percent"] = (current / total) * 100 if total else 0
+
+            # ПАТЧ: прогресс в консоль, но не чаще, чем каждые 10%
+            pct = (current / total * 100) if total else 0
+            last_pct = st.get("_last_logged_pct", -1)
+            if pct - last_pct >= 10 or current == total:
+                st["_last_logged_pct"] = pct
+                logger.info(
+                    "📤 [manual upload] %s: %.1f%% (%s / %s)",
+                    display_name, pct,
+                    human_size(current), human_size(total),
+                )
+
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
     manual_caption = None
     kind = _get_send_kind(path)
-    ext_lower = os.path.splitext(path)[1].lower()
     if kind == "video":
         manual_caption = f"🎬 {display_name}"
-    # ПАТЧ: для .ogg/.opus/.oga caption НЕ ставим здесь —
-    # _send_media сам решит: voice (короткий) или audio (длинный).
-    # Если voice — caption добавится в _send_media.
-    # Если audio — caption не нужен (аудиофайл с плеером).
     elif kind == "document":
         manual_caption = f"📎 {display_name}"
-        
 
-    # ПАТЧ: убираем upload_lock — Telegram сам обрабатывает
-    # параллельные send_file. Ручные аплоады больше не сериализуются.
     sent = await _send_media(
         "me", path, display_name, upload_cb,
         caption=manual_caption,
@@ -3295,7 +3400,9 @@ async def enqueue_manual_files(paths: list[str]):
             status_msg = await client.send_message(
                 "me", f"📋 {name} (локальный файл)"
             )
-            key = ("me", -idx)
+            # ПАТЧ: уникальный ключ на основе batch_id
+            unique_mid = -(batch_id * 1_000_000 + idx)
+            key = ("me", unique_mid)
             status_msgs[key] = status_msg
             link_states[key] = {
                 "status": "downloaded",
@@ -3311,7 +3418,7 @@ async def enqueue_manual_files(paths: list[str]):
 
             items.append({
                 "chat_id": "me",
-                "msg_id": -idx,
+                "msg_id": unique_mid,
                 "link": name,
                 "status": "downloaded",
                 "status_msg_id": status_msg.id,
@@ -3368,6 +3475,9 @@ async def handle_saved_messages(event):
                 f"они завершатся, новые отменены."
             )
 
+        # ПАТЧ: чистим кэш поиска в me — файлы могли быть удалены
+        _find_cache.clear()
+
         async with batch_create_lock:
             cleared = 0
             while not link_queue.empty():
@@ -3385,11 +3495,22 @@ async def handle_saved_messages(event):
                     *_pending_manual_uploads, return_exceptions=True
                 )
 
+            # ПАТЧ: отменяем отложенные удаления
+            for t in list(_pending_deletions):
+                t.cancel()
+            if _pending_deletions:
+                await asyncio.gather(
+                    *_pending_deletions, return_exceptions=True
+                )
+
             cleared_batches = 0
             for batch_id, b in list(batches.items()):
                 if b.get("finished"):
                     continue
+                # ПАТЧ: помечаем как отменённый ДО удаления —
+                # воркеры увидят флаг и прервутся
                 b["finished"] = True
+                b["cancelled"] = True
 
                 # NEW: чистим processed и собираем id статусов/слотов
                 to_delete_ids: list[int] = []
@@ -3569,50 +3690,53 @@ async def handle_saved_messages(event):
     except Exception:
         pass
 
-
 def _print_scan_summary(scan: dict):
     if scan["manual"]:
-        print(f"\n📂 Найдено файлов без записи в очереди: {len(scan['manual'])}")
+        logger.info(
+            "📂 Найдено файлов без записи в очереди: %d",
+            len(scan["manual"]),
+        )
         for f in scan["manual"][:20]:
             try:
                 sz = human_size(os.path.getsize(f))
             except Exception:
                 sz = "?"
-            print(f"   • {os.path.basename(f)} ({sz})")
+            logger.info("   • %s (%s)", os.path.basename(f), sz)
         if len(scan["manual"]) > 20:
-            print(f"   … и ещё {len(scan['manual']) - 20}")
+            logger.info("   … и ещё %d", len(scan["manual"]) - 20)
 
     if scan.get("anomalous_done"):
-        print(
-            f"\n📂 Найдено файлов с терминальным статусом в JSON, "
-            f"но на диске: {len(scan['anomalous_done'])} — проверю в «Избранном»"
+        logger.info(
+            "📂 Найдено файлов с терминальным статусом в JSON, "
+            "но на диске: %d — проверю в «Избранном»",
+            len(scan["anomalous_done"]),
         )
         for _, it, f in scan["anomalous_done"][:20]:
-            print(f"   • {os.path.basename(f)} ← {it['link']}")
+            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
         if len(scan["anomalous_done"]) > 20:
-            print(f"   … и ещё {len(scan['anomalous_done']) - 20}")
+            logger.info("   … и ещё %d", len(scan["anomalous_done"]) - 20)
 
     if scan["own_partial"]:
-        print(
-            f"\n📂 Найдено недокачанных файлов "
-            f"(есть запись в очереди): {len(scan['own_partial'])} — перекачиваю"
+        logger.info(
+            "📂 Найдено недокачанных файлов (есть запись в очереди): %d — "
+            "перекачиваю",
+            len(scan["own_partial"]),
         )
         for _, it, f in scan["own_partial"][:20]:
-            print(f"   • {os.path.basename(f)} ← {it['link']}")
+            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
         if len(scan["own_partial"]) > 20:
-            print(f"   … и ещё {len(scan['own_partial']) - 20}")
+            logger.info("   … и ещё %d", len(scan["own_partial"]) - 20)
 
     if scan["own_ready"]:
-        print(
-            f"\n📂 Найдено готовых к отправке файлов "
-            f"(есть запись в очереди): {len(scan['own_ready'])} — "
-            f"поставлю в очередь на отправку"
+        logger.info(
+            "📂 Найдено готовых к отправке файлов (есть запись в очереди): "
+            "%d — поставлю в очередь на отправку",
+            len(scan["own_ready"]),
         )
         for _, it, f in scan["own_ready"][:20]:
-            print(f"   • {os.path.basename(f)} ← {it['link']}")
+            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
         if len(scan["own_ready"]) > 20:
-            print(f"   … и ещё {len(scan['own_ready']) - 20}")
-
+            logger.info("   … и ещё %d", len(scan["own_ready"]) - 20)
 
 # ---------- Запуск ----------
 async def main():
@@ -3622,6 +3746,24 @@ async def main():
     batch_create_lock = asyncio.Lock()
     shutdown_event = asyncio.Event()
     upload_lock = asyncio.Lock()
+
+    # ПАТЧ: SIGINT/SIGTERM → shutdown_event, а не KeyboardInterrupt
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(sig_name: str):
+        if not shutdown_event.is_set():
+            logger.warning("🛑 Получен %s — завершаю работу...", sig_name)
+            shutdown_event.set()
+
+    for sig in ("SIGINT", "SIGTERM"):
+        try:
+            loop.add_signal_handler(
+                getattr(_signal, sig),
+                _request_shutdown, sig,
+            )
+        except (NotImplementedError, AttributeError):
+            # Windows: add_signal_handler не поддерживается для SIGTERM
+            pass
     existing_ids = _list_queue_files()
     if existing_ids:
         batch_counter["id"] = max(existing_ids)
@@ -3761,39 +3903,61 @@ async def main():
 
     manual_send = False
     if scan["manual"]:
-        ans = (await asyncio.to_thread(
-            input, "\nОтправить их в Избранное? [y/n]: "
-        )).strip().lower()
+        # ПАТЧ: таймаут на ввод — 60 секунд, потом считаем «n»
+        _INPUT_TIMEOUT = 60.0
+
+        def _input_with_timeout(prompt: str, timeout: float):
+            if sys.platform != "win32":
+                print(prompt, end="", flush=True)
+                rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+                if rlist:
+                    return sys.stdin.readline().strip()
+                print()
+                return ""
+            # Windows fallback — обычный input (без таймаута)
+            return input(prompt).strip()
+
+        try:
+            ans = (await asyncio.to_thread(
+                _input_with_timeout,
+                "\nОтправить их в Избранное? [y/n, 60s]: ",
+                _INPUT_TIMEOUT,
+            )).lower()
+        except Exception:
+            ans = ""
         manual_send = ans in ("y", "yes", "да", "д")
         if not manual_send:
-            print("   ⏭  Пропущено — спрошу при следующем запуске.")
+            logger.info("⏭  Пропущено — спрошу при следующем запуске.")
 
     session_file = os.path.join(BASE_DIR, "user_session.session")
     had_session_file = os.path.exists(session_file)
 
-    print("\n⏳ Подключение к Telegram...")
+    logger.info("⏳ Подключение к Telegram...")
     await client.start()
 
     authorized = await client.is_user_authorized()
     if not had_session_file or not authorized:
-        print("  📇 Первый запуск или сессия недействительна — загружаю диалоги...")
+        logger.info(
+            "📇 Первый запуск или сессия недействительна — загружаю диалоги..."
+        )
         await client.get_dialogs()
     else:
-        print("  📇 Сессия в порядке — диалоги не перезагружаем.")
+        logger.info("📇 Сессия в порядке — диалоги не перезагружаем.")
 
     me = await client.get_me()
     account_state["is_premium"] = bool(getattr(me, "premium", False))
     limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
-    print(
-        f"  👤 Аккаунт: @{me.username or me.id} "
-        f"({'Premium' if account_state['is_premium'] else 'Free'})"
+    logger.info(
+        "👤 Аккаунт: @%s (%s)",
+        me.username or me.id,
+        "Premium" if account_state["is_premium"] else "Free",
     )
-    print(f"  📦 Лимит на отправку: {human_size(limit)}")
+    logger.info("📦 Лимит на отправку: %s", human_size(limit))
 
     if scan.get("anomalous_done"):
-        print(
-            f"\n🔍 Проверяю {len(scan['anomalous_done'])} аномальных "
-            f"файлов в «Избранном»..."
+        logger.info(
+            "🔍 Проверяю %d аномальных файлов в «Избранном»...",
+            len(scan["anomalous_done"]),
         )
         for qid, it, full in scan["anomalous_done"]:
             name = os.path.basename(full)
@@ -3806,15 +3970,18 @@ async def main():
                     display_name=name, file_size=size,
                 )
             except FloodWaitError as fwe:
-                print(
-                    f"  ⏳ FloodWait {fwe.seconds}s при проверке {name} — "
-                    f"оставляю как manual"
+                logger.warning(
+                    "⏳ FloodWait %ss при проверке %s — оставляю как manual",
+                    fwe.seconds, name,
                 )
                 await asyncio.sleep(fwe.seconds)
                 scan["manual"].append(full)
                 continue
             except Exception as e:
-                print(f"  ⚠️  ошибка проверки {name}: {e} — оставляю как manual")
+                logger.warning(
+                    "⚠️  ошибка проверки %s: %s — оставляю как manual",
+                    name, e,
+                )
                 scan["manual"].append(full)
                 continue
 
@@ -3839,19 +4006,21 @@ async def main():
                     _save_queue(qid)
                 try:
                     os.remove(full)
-                    print(
-                        f"  ♻️  {name}: уже в «Избранном» "
-                        f"(id={found_id}) — помечен done, файл удалён"
+                    logger.info(
+                        "♻️  %s: уже в «Избранном» (id=%s) — "
+                        "помечен done, файл удалён",
+                        name, found_id,
                     )
                 except Exception as e:
-                    print(f"  ⚠️  не удалось удалить {name}: {e}")
+                    logger.warning("⚠️  не удалось удалить %s: %s", name, e)
             else:
                 # ПАТЧ 6: файл есть, но в me нет — помечаем fail в JSON,
                 # чтобы не возвращаться к нему при каждом запуске
                 # (бесконечный цикл anomalous_done).
-                print(
-                    f"  📂 {name}: в «Избранном» не найден — "
-                    f"помечаю fail в JSON (файл оставляю как manual)"
+                logger.warning(
+                    "📂 %s: в «Избранном» не найден — "
+                    "помечаю fail в JSON (файл оставляю как manual)",
+                    name,
                 )
                 q = queues.get(qid) or _load_queue(qid)
                 if q is not None:
@@ -3869,31 +4038,32 @@ async def main():
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
     ]
-    print(f"  ▶ Запущено воркеров скачивания: {CONCURRENT_DOWNLOADS}")
+    logger.info("▶ Запущено воркеров скачивания: %d", CONCURRENT_DOWNLOADS)
 
     upload_workers = [
         asyncio.create_task(_upload_worker(i + 1))
         for i in range(CONCURRENT_UPLOADS)
     ]
-    print(
-        f"  📤 Запущено upload-воркеров: {CONCURRENT_UPLOADS} "
-        f"(параллельно, commit по порядку)"
+    logger.info(
+        "📤 Запущено upload-воркеров: %d (параллельно, commit по порядку)",
+        CONCURRENT_UPLOADS,
     )
 
     watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
-    print("  🐕 Запущен watchdog зависших пачек")
+    logger.info("🐕 Запущен watchdog зависших пачек")
 
     await resume_pending_queues()
 
     failed_send = await offer_send_downloaded()
 
     if failed_send:
-        print(
-            f"\n⚠️  ВНИМАНИЕ: {len(failed_send)} файлов не удалось "
-            f"поставить в очередь на отправку:"
+        logger.warning(
+            "⚠️  ВНИМАНИЕ: %d файлов не удалось поставить в очередь "
+            "на отправку:",
+            len(failed_send),
         )
         for qid, it, reason in failed_send:
-            print(f"   • #{qid} {it.get('link', '?')}: {reason}")
+            logger.warning("   • #%s %s: %s", qid, it.get("link", "?"), reason)
 
         try:
             lines = [
@@ -3916,9 +4086,9 @@ async def main():
             )
             await client.send_message("me", "\n".join(lines))
         except Exception as e:
-            print(f"   ⚠️  не удалось уведомить в me: {e}")
+            logger.warning("⚠️  не удалось уведомить в me: %s", e)
     else:
-        print("  ✅ Все найденные файлы поставлены в очередь на отправку")
+        logger.info("✅ Все найденные файлы поставлены в очередь на отправку")
 
     for qid in _list_queue_files():
         _close_queue_if_finished(qid)
@@ -3926,16 +4096,13 @@ async def main():
     if manual_send:
         await enqueue_manual_files(scan["manual"])
 
-    print(
-        f"\n🚀 Готово!\n"
-        f"├ Каждая ссылка — отдельное сообщение\n"
-        f"├ Одновременно качается: {CONCURRENT_DOWNLOADS}\n"
-        f"├ После загрузки: файл заменит сообщение (только при успехе)\n"
-        f"├ Перетусовка: {'после закачки всей пачки' if REORDER_AFTER_EACH_FILE else 'по завершении пачки'}\n"
-        f"└ Команды:\n"
-        f"└ /quit - остановка скрипта (очередь сохраняется)\n"
-        f"└ /clear - очистка очереди\n"
-        f"└ /stats - статистика"
+    logger.info(
+        "🚀 Готово! Каждая ссылка — отдельное сообщение, "
+        "одновременно качается %d, перетусовка: %s. "
+        "Команды: /quit /clear /stats",
+        CONCURRENT_DOWNLOADS,
+        "после закачки всей пачки" if REORDER_AFTER_EACH_FILE
+        else "по завершении пачки",
     )
 
     try:
@@ -3949,7 +4116,7 @@ async def main():
             if not t.done():
                 t.cancel()
         await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
-        print("🛑 Завершение работы...")
+        logger.info("🛑 Завершение работы...")
     finally:
         watchdog_task.cancel()
         for uw in upload_workers:
@@ -3977,13 +4144,32 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.WARNING,
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
     )
+    # Telethon — только WARNING, чтобы не засорять консоль
     logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("telethon.network").setLevel(logging.WARNING)
+
+    # На Windows add_signal_handler не работает — ставим fallback
+    if sys.platform == "win32":
+        def _win_ctrl_c(signum, frame):
+            logger.warning("🛑 Ctrl+C — завершаю работу...")
+            try:
+                if shutdown_event is not None and not shutdown_event.is_set():
+                    shutdown_event.set()
+                    return
+            except Exception:
+                pass
+            raise KeyboardInterrupt
+        _signal.signal(_signal.SIGINT, _win_ctrl_c)
+    # На Unix полагаемся на loop.add_signal_handler в main().
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Остановлено пользователем (Ctrl+C).")
-    except Exception as crash_error:
-        print(f"\n❌ КРИТИЧЕСКИЙ СБОЙ: {crash_error}")
+        logger.warning("🛑 Остановлено пользователем (Ctrl+C).")
+    except Exception:
+        logger.exception("❌ КРИТИЧЕСКИЙ СБОЙ")
