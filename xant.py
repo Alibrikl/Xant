@@ -218,8 +218,79 @@ def _detect_kind(message) -> str:
 
 
 def build_filename(message) -> str:
-    original = message.file.name if message.file and message.file.name else None
-    _log(f"[build_filename] id={message.id} name={original!r} kind={_detect_kind(message)}")
+    """
+    ПАТЧ: пытаемся получить оригинальное имя файла из разных мест:
+      1. DocumentAttributeFilename.file_name (если отправлен как документ)
+      2. DocumentAttributeAudio.title / performer (ID3-теги)
+      3. message.text (caption) — первая строка, если похоже на имя
+      4. Fallback: record_{id}.ogg / voice_{id}.ogg / file_{id}.ext
+    """
+    original = None
+    source = None
+
+    # 1. file.name (Telegram иногда даёт)
+    if message.file and message.file.name:
+        original = message.file.name
+        source = "file.name"
+
+    # 2. DocumentAttributeFilename.file_name
+    if not original and isinstance(message.media, types.MessageMediaDocument):
+        doc = message.media.document
+        if isinstance(doc, types.Document):
+            for attr in doc.attributes:
+                if isinstance(attr, types.DocumentAttributeFilename):
+                    if attr.file_name:
+                        original = attr.file_name
+                        source = "DocumentAttributeFilename"
+                        break
+
+    # 3. DocumentAttributeAudio.title
+    if not original and isinstance(message.media, types.MessageMediaDocument):
+        doc = message.media.document
+        if isinstance(doc, types.Document):
+            for attr in doc.attributes:
+                if isinstance(attr, types.DocumentAttributeAudio):
+                    if attr.title:
+                        original = attr.title
+                        source = "DocumentAttributeAudio.title"
+                        break
+
+    # 4. message.text (caption) — первая строка, если похоже на имя
+    if not original and message.text:
+        first_line = message.text.strip().split("\n")[0].strip()
+        # Похоже на имя: не URL, не пустое, длина 1-100, нет запрещённых символов
+        if (
+            first_line
+            and 1 <= len(first_line) <= 100
+            and "http" not in first_line.lower()
+            and "www." not in first_line.lower()
+        ):
+            original = first_line
+            source = "message.text"
+
+    _log(
+        f"[build_filename] id={message.id} kind={_detect_kind(message)} "
+        f"source={source!r} original={original!r}"
+    )
+
+    # ПАТЧ: «бесполезные» имена (record.ogg, audio.ogg, voice.ogg) —
+    # считаем, что оригинала нет. Иначе все файлы будут record.ogg,
+    # record (1).ogg, record (2).ogg и т.д.
+    _USELESS_BASENAMES = {
+        "record", "audio", "voice", "file", "track", "sound",
+        "audio_file", "voice_file", "record_file",
+        "telegram_audio", "telegram_voice", "telegram_record",
+    }
+    if original:
+        _base_check, _ = os.path.splitext(original)
+        if _base_check.strip().lower() in _USELESS_BASENAMES:
+            _log(
+                f"  [build_filename] «бесполезное» имя {original!r} — "
+                f"считаю, что оригинала нет"
+            )
+            original = None
+            source = None
+
     if original:
         base, ext = os.path.splitext(original)
         base = _sanitize(base) or "file"
@@ -228,9 +299,22 @@ def build_filename(message) -> str:
     else:
         base = f"{_detect_kind(message)}_{message.id}"
         ext = _detect_extension(message)
+
     if not ext:
         ext = _detect_extension(message) or ".bin"
-    filename = f"{base}_{message.id}{ext}"
+
+    # ПАТЧ: для voice/audio/record не добавляем _{id}, если имя уже осмысленное
+    is_audio_like = ext.lower() in {
+        ".ogg", ".opus", ".oga", ".mp3", ".m4a",
+        ".aac", ".flac", ".wav",
+    }
+    if is_audio_like and original:
+        # Имя уже есть — не добавляем _{id}
+        filename = f"{base}{ext}"
+    else:
+        # Fallback или видео/документ — добавляем _{id} для уникальности
+        filename = f"{base}_{message.id}{ext}"
+
     filename = _truncate_to_bytes(filename, _MAX_NAME_BYTES)
     return filename
 
