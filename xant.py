@@ -566,10 +566,6 @@ def _recover_queues_from_downloads():
         for name in os.listdir(DOWNLOAD_DIR):
             if name.endswith(".part"):
                 continue
-            # ПАТЧ: пропускаем временные voice_opus-файлы
-            # (могут остаться, если процесс был убит во время перекодирования)
-            if ".voice_opus_" in name:
-                continue
             full = os.path.join(DOWNLOAD_DIR, name)
             if not os.path.isfile(full):
                 continue
@@ -650,18 +646,24 @@ def _scan_downloads() -> dict:
         if not os.path.isfile(full):
             continue
 
-        # ПАТЧ: .part — всегда «частичный», независимо от JSON
+        # ---------- .part ----------
         if name.endswith(".part"):
-            base_name = name[:-5]  # без ".part"
+            base_name = name[:-5]
             entry = own_by_name.get(base_name) or own_by_name.get(name)
             if entry is not None:
                 qid, it = entry
                 own_partial.append((qid, it, full))
             else:
-                manual.append(full)
+                # осиротевший .part — удаляем, к отправке не предлагаем
+                try:
+                    os.remove(full)
+                    _log(f"[scan] удалён осиротевший .part: {name}")
+                except Exception as e:
+                    _log(f"[scan] не удалось удалить .part {name}: {e}")
             continue
 
-        entry = own_by_name.get(name)
+        # ---------- обычный файл ----------
+        entry = own_by_name.get(name)          # ← ВОЗВРАЩЕНО
         if entry is None:
             manual.append(full)
             continue
@@ -702,6 +704,11 @@ def _cleanup_partial(local_path: str, expected_size: int = 0):
             if expected_size > 0:
                 actual = os.path.getsize(path)
                 if actual >= expected_size:
+                    continue
+            else:
+                # ПАТЧ: если размер неизвестен — не трогаем финальный файл,
+                # только .part. Иначе можно потерять уже скачанный целый файл.
+                if not path.endswith(".part"):
                     continue
             os.remove(path)
             removed = True
@@ -769,11 +776,24 @@ async def download_with_retry(
         )
         return None
 
-    # ---------- 2. Размер и место на диске ----------
+    # ---------- 2. Размер, лимит Telegram и место на диске ----------
     if size_holder is not None:
         size_holder["size"] = target_msg.file.size if target_msg.file else 0
 
         if size_holder["size"] > 0:
+            # ПАТЧ: проверяем лимит Telegram ДО скачивания, чтобы
+            # не тратить трафик и диск на файл, который всё равно
+            # не отправим.
+            _limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
+            if size_holder["size"] > _limit:
+                logger.warning(
+                    "[limit] %s/%s: %s > %s — пропуск без скачивания",
+                    chat_id, msg_id,
+                    human_size(size_holder["size"]),
+                    human_size(_limit),
+                )
+                return None
+
             try:
                 free = shutil.disk_usage(DOWNLOAD_DIR).free
                 need = size_holder["size"] * 1.1
@@ -807,13 +827,18 @@ async def download_with_retry(
             f"(размер={human_size(size_holder.get('size', 0) if size_holder else 0)})"
         )
 
+         # ПАТЧ: таймаут зависит от размера — 30 мин базово + время
+        # на скачивание при скорости ~100 КБ/с (с запасом).
+        _sz = size_holder.get("size", 0) if size_holder else 0
+        _dl_timeout = max(1800, int(_sz / (100 * 1024)) + 600)
+
         try:
             result = await asyncio.wait_for(
                 client.download_media(
                     target_msg, file=part_path,
                     progress_callback=progress_callback,
                 ),
-                timeout=1800,
+                timeout=_dl_timeout,
             )
             # Атомарно переименовываем .part → финальное имя
             if result and os.path.exists(part_path):
@@ -873,7 +898,7 @@ async def download_with_retry(
             attempt += 1
             _log(
                 f"[download] TIMEOUT download_media {chat_id}/{msg_id} "
-                f"(1800s, попытка {attempt}/{max_retries})"
+                f"({_dl_timeout}s, попытка {attempt}/{max_retries})"
             )
             _cleanup_partial(
                 local_path,
@@ -1186,12 +1211,17 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         if performer:
             performer = performer[:128]
 
+        # ПАТЧ: короткие ogg/opus (< 60 c) — как голосовые сообщения.
+        is_voice = (
+            ext_lower in (".ogg", ".opus", ".oga")
+            and 0 < d <= 60
+        )
         attrs = [
             DocumentAttributeAudio(
                 duration=d,
                 title=title,
                 performer=performer,
-                voice=False,
+                voice=is_voice,
             ),
             name_attr,
         ]
@@ -1211,6 +1241,7 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         _log(f"[_send_media] {display_name}: gif → как анимация")
         result = await client.send_file(
             chat, path,
+            attributes=[name_attr],   # ← сохраняем имя для дедупликации
             caption=caption,
             progress_callback=progress_cb,
         )
@@ -2098,7 +2129,13 @@ async def _upload_worker(worker_id: int = 0):
                     b.get("_uploading", set()).discard(key)
                     # ПАТЧ: после снятия _uploading проверяем завершение batch —
                     # иначе batch закроется только на следующем тике (через 1 сек)
-                    await _maybe_finish_batch(batch_id)
+                    try:
+                        await _maybe_finish_batch(batch_id)
+                    except Exception:
+                        logger.exception(
+                            "[_upload_worker #%s] _maybe_finish_batch упал "
+                            "для batch %s", worker_id, batch_id,
+                        )
 
         except asyncio.CancelledError:
             return
@@ -2277,13 +2314,6 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     kind = _get_send_kind(filename)
     if kind == "video":
         caption = f"🎬 {display_name}"
-    elif kind == "photo":
-        # ПАТЧ: для фото — caption с именем (опционально, можно убрать).
-        caption = f"🖼️ {display_name}"
-    # ПАТЧ: для .ogg/.opus/.oga caption НЕ ставим здесь —
-    # _send_media сам решит: voice (короткий) или audio (длинный).
-    elif kind == "document":
-        caption = f"📎 {display_name}"
 
     try:
         # ПАТЧ U1: убираем upload_lock — 3 воркера должны отправлять параллельно.
@@ -2424,8 +2454,6 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
     ПАТЧ 2: вместо «таск upload-воркера жив» проверяем heartbeat
     b["_last_upload_activity_ts"] — воркер РЕАЛЬНО прогрессирует.
     Иначе зависший на FloodWait/сети воркер навсегда заблокирует watchdog.
-    ПАТЧ 3: уважает _upload_wait_state["ts"] — если воркер ждёт барьер,
-    watchdog не трогает downloaded.
     ПАТЧ 5: барьер перед downloaded проверяется от ПЕРВОГО не-терминального
     элемента.
     """
@@ -3410,11 +3438,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
     kind = _get_send_kind(path)
     if kind == "video":
         manual_caption = f"🎬 {display_name}"
-    elif kind == "photo":
-        # ПАТЧ: для фото — caption с именем.
-        manual_caption = f"🖼️ {display_name}"
-    elif kind == "document":
-        manual_caption = f"📎 {display_name}"
 
     sent = await _send_media(
         "me", path, display_name, upload_cb,
@@ -3491,7 +3514,13 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
         b_fin = batches.get(batch_id)
         if b_fin is not None:
             b_fin.get("_uploading", set()).discard(key)
-        await _maybe_finish_batch(batch_id)
+        try:
+            await _maybe_finish_batch(batch_id)
+        except Exception:
+            logger.exception(
+                "[_run_manual_upload] _maybe_finish_batch упал для batch %s",
+                batch_id,
+            )
 
 
 async def enqueue_manual_files(paths: list[str]):
