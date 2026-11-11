@@ -50,6 +50,12 @@ PHOTO_EXTS = {
     ".bmp", ".tif", ".tiff", ".heic", ".heif",
 }
 
+_USELESS_BASENAMES = {"record", "audio", "voice", "file", "track", "sound",
+    "audio_file", "voice_file", "record_file",
+    "telegram_audio", "telegram_voice", "telegram_record",
+}
+
+
 if not os.path.exists(ENV_FILE):
     print("==================================================")
     print("🚀 Добро пожаловать в Xant")
@@ -294,14 +300,12 @@ def build_filename(message) -> str:
     # ПАТЧ: «бесполезные» имена (record.ogg, audio.ogg, voice.ogg) —
     # считаем, что оригинала нет. Иначе все файлы будут record.ogg,
     # record (1).ogg, record (2).ogg и т.д.
-    _USELESS_BASENAMES = {
-        "record", "audio", "voice", "file", "track", "sound",
-        "audio_file", "voice_file", "record_file",
-        "telegram_audio", "telegram_voice", "telegram_record",
-    }
     if original:
         _base_check, _ = os.path.splitext(original)
-        if _base_check.strip().lower() in _USELESS_BASENAMES:
+        _base_norm = _base_check.strip().lower()
+        _base_norm = re.sub(r"[_\s]*\(\d+\)$", "", _base_norm)
+        _base_norm = re.sub(r"_\d+$", "", _base_norm)
+        if _base_norm in _USELESS_BASENAMES:
             _log(
                 f"  [build_filename] «бесполезное» имя {original!r} — "
                 f"считаю, что оригинала нет"
@@ -1211,11 +1215,28 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
         if performer:
             performer = performer[:128]
 
-        # ПАТЧ: короткие ogg/opus (< 60 c) — как голосовые сообщения.
+        # ПАТЧ: OGG/Opus отправляем как голосовое ТОЛЬКО если имя
+        # «бесполезное» (record, voice, audio и т.п.). Если у файла
+        # осмысленное имя — отправляем как обычный аудиофайл,
+        # чтобы имя сохранилось (Telegram у voice имя не показывает).
+        _base_check = os.path.splitext(display_name)[0].strip().lower()
+        # убираем суффикс " (N)" / "_N", добавленный unique_path/_sanitize
+        _base_norm = re.sub(r"[_\s]*\(\d+\)$", "", _base_check)
+        _base_norm = re.sub(r"_\d+$", "", _base_norm)
+        _has_meaningful_name = _base_norm not in _USELESS_BASENAMES
+
         is_voice = (
             ext_lower in (".ogg", ".opus", ".oga")
             and 0 < d <= 60
+            and not _has_meaningful_name
         )
+
+        _log(
+            f"[_send_media] {display_name}: is_voice={is_voice} "
+            f"(base={_base_check!r}, meaningful={_has_meaningful_name}, "
+            f"dur={d})"
+        )
+
         attrs = [
             DocumentAttributeAudio(
                 duration=d,
