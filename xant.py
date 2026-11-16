@@ -4183,6 +4183,18 @@ async def main():
     else:
         logger.info("📇 Сессия в порядке — диалоги не перезагружаем.")
 
+    # ПАТЧ: принудительно загружаем диалоги, чтобы Telethon получил
+    # access_hash для приватных каналов (t.me/c/...). Без этого
+    # скачивание по ID падает с "Could not find the input entity".
+    _force_dialogs = os.getenv("FORCE_GET_DIALOGS", "1") == "1"
+    if _force_dialogs:
+        logger.info("📇 Принудительная загрузка диалогов (FORCE_GET_DIALOGS=1)...")
+        try:
+            dialogs = await client.get_dialogs(limit=None)
+            logger.info("📇 Загружено диалогов: %d", len(dialogs))
+        except Exception as e:
+            logger.warning("⚠️  get_dialogs упал: %s", e)
+
     me = await client.get_me()
     account_state["is_premium"] = bool(getattr(me, "premium", False))
     limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
