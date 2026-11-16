@@ -95,7 +95,7 @@ in_progress = {"count": 0}
 batches: dict[int, dict] = {}
 batch_counter = {"id": 0}
 
-account_state = {"is_premium": False}
+account_state = {"is_premium": False, "download_only": False}
 
 queues: dict[int, dict] = {}
 
@@ -674,6 +674,13 @@ def _scan_downloads() -> dict:
 
         qid, it = entry
         status = it.get("status")
+
+        # ПАТЧ /nome: файлы, скачанные в режиме «только скачивание»,
+        # не считаем аномальными — они специально остались на диске.
+        # При следующем запуске предложим их отправить (как manual).
+        if it.get("download_only"):
+            manual.append(full)
+            continue
 
         if status in ("pending", "downloading"):
             own_partial.append((qid, it, full))
@@ -2213,6 +2220,49 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     display_name = os.path.basename(filename)
     file_size = it.get("file_size") or os.path.getsize(filename)
 
+    # ПАТЧ /nome: режим «только скачать» — файл остаётся в downloads/,
+    # в me не отправляем. Ставим done, но сохраняем local_file,
+    # чтобы пользователь мог забрать файл вручную и/или при выключении
+    # режима файл не потерялся.
+    if account_state.get("download_only"):
+        _log(
+            f"📥 /nome: {full_link}: только скачивание — "
+            f"в me не отправляю (файл остаётся в downloads/)"
+        )
+        _mark_item(
+            batch_id, chat_id, msg_id,
+            status="done",
+            file_message_id=None,
+            # local_file НЕ обнуляем — файл остаётся на диске
+            downloaded_at=time.time(),
+            download_only=True,    
+            upload_retries=0,
+            next_retry_ts=0,
+        )
+        st["status"] = "done"
+
+        status_msg = batch["status_msgs"].pop(key, None)
+        if status_msg is not None:
+            try:
+                await status_msg.edit(
+                    f"✅ {display_name} ({human_size(file_size)}) — "
+                    f"скачано (только downloads/, /nome)"
+                )
+                _mark_item(batch_id, chat_id, msg_id,
+                           status_msg_id=None, slot_msg_id=None)
+            except MessageNotModifiedError:
+                pass
+            except Exception as e:
+                _log(
+                    f"⚠️  /nome: {full_link}: не удалось обновить "
+                    f"статус: {e}"
+                )
+        else:
+            _mark_item(batch_id, chat_id, msg_id,
+                       status_msg_id=None, slot_msg_id=None)
+
+        return "ok"
+
     # ПАТЧ U7: проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
     # Если да — НЕ ставим uploading (📤 не мигнёт), сразу done + ✅.
     # ПАТЧ: для фото _find_in_me не работает (нет file.name) — пропускаем.
@@ -3627,6 +3677,18 @@ async def handle_saved_messages(event):
         shutdown_event.set()
         return
     
+    if cmd == "/nome":
+        account_state["download_only"] = not account_state["download_only"]
+        state_txt = (
+            "🟢 ВКЛ" if account_state["download_only"]
+            else "🔴 ВЫКЛ"
+        )
+        await event.respond(
+            f"📥 Режим «только скачивание»: {state_txt}\n"
+            f"{'Файлы будут оставаться в downloads/ и НЕ отправляться в me.' if account_state['download_only'] else 'Файлы будут скачиваться и отправляться в me как обычно.'}"
+        )
+        return
+    
     if cmd == "/clear":
         if in_progress["count"] > 0:
             await event.respond(
@@ -3711,12 +3773,30 @@ async def handle_saved_messages(event):
         return
 
     if cmd == "/stats":
+        _nome = "🟢 ВКЛ" if account_state.get("download_only") else "🔴 ВЫКЛ"
         await event.respond(
             f"📊 **Статистика**\n"
             f"├ Ожидает в очереди: {link_queue.qsize()}\n"
             f"├ В работе: {in_progress['count']} / {CONCURRENT_DOWNLOADS}\n"
             f"├ Активных пачек: {len(batches)}\n"
+            f"├ Только скачивание: {_nome}\n"
             f"└ Обработано уникальных: {len(processed)}"
+        )
+        return
+
+    if cmd == "/nome":
+        account_state["download_only"] = not account_state["download_only"]
+        state_txt = (
+            "🟢 ВКЛ" if account_state["download_only"]
+            else "🔴 ВЫКЛ"
+        )
+        await event.respond(
+            f"📥 Режим «только скачивание»: {state_txt}\n"
+            + (
+                "Файлы будут оставаться в downloads/ и НЕ отправляться в me."
+                if account_state["download_only"]
+                else "Файлы будут скачиваться и отправляться в me как обычно."
+            )
         )
         return
 
@@ -4258,7 +4338,7 @@ async def main():
     logger.info(
         "🚀 Готово! Каждая ссылка — отдельное сообщение, "
         "одновременно качается %d, перетусовка: %s. "
-        "Команды: /quit /clear /stats",
+        "Команды: /quit /clear /stats /nome",
         CONCURRENT_DOWNLOADS,
         "после закачки всей пачки" if REORDER_AFTER_EACH_FILE
         else "по завершении пачки",
