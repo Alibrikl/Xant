@@ -3595,19 +3595,20 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
         b = batches.get(batch_id)
         if b is not None:
             if ok:
-                b["ok"] += 1
+                b["ok"] = b.get("ok", 0) + 1
             else:
                 _log(
                     f"⚠️  _run_manual_upload: upload_manual_file вернул "
                     f"{ok!r} вместо True для {os.path.basename(path)} — fail"
                 )
-                b["fail"] += 1
+                b["fail"] = b.get("fail", 0) + 1
     except Exception as e:
         _log(f"❌  Файл {os.path.basename(path)}: {type(e).__name__}: {e}")
-        _mark_item(batch_id, item["chat_id"], item["msg_id"], status="fail", next_retry_ts=0)
+        _mark_item(batch_id, item["chat_id"], item["msg_id"],
+                   status="fail", next_retry_ts=0)
         b = batches.get(batch_id)
         if b is not None:
-            b["fail"] += 1
+            b["fail"] = b.get("fail", 0) + 1
     finally:
         b_fin = batches.get(batch_id)
         if b_fin is not None:
@@ -3615,9 +3616,9 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
         try:
             await _maybe_finish_batch(batch_id)
         except Exception:
-            _log(f
-                "[_run_manual_upload] _maybe_finish_batch упал для batch %s",
-                batch_id,
+            _log(
+                f"[_run_manual_upload] _maybe_finish_batch упал "
+                f"для batch {batch_id}"
             )
 
 
