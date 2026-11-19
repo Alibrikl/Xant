@@ -36,40 +36,76 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 
 # ---------- Выбор папки скачивания ----------
+def _can_write(dir_path: str) -> bool:
+    """
+    Реальная проверка записи: пробуем создать/удалить тестовый файл.
+    os.access() ненадёжен на Termux/Android/сетевых ФС — он смотрит
+    только права, а не фактическую возможность записи.
+    """
+    test_file = os.path.join(dir_path, ".write_test")
+    try:
+        with open(test_file, "w") as f:
+            f.write("x")
+        os.remove(test_file)
+        return True
+    except Exception:
+        # Подчистим, если файл успел создаться, но remove упал
+        try:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+        except Exception:
+            pass
+        return False
+
+
 def _pick_download_dir() -> tuple[str, str]:
     """
     Возвращает (download_dir, reason).
     Приоритет:
-      1. ~/storage/downloads/Xant — если родитель (~/storage/downloads) доступен.
+      1. ~/storage/downloads/Xant — если удалось создать и записать.
       2. <BASE_DIR>/downloads    — fallback рядом со скриптом.
     """
     storage_root = os.path.expanduser("~/storage/downloads")
     preferred = os.path.join(storage_root, "Xant")
 
-    # Проверяем, что родительская папка существует и доступна на запись.
-    storage_ok = False
+    # 1. Родитель существует?
     if os.path.isdir(storage_root):
-        try:
-            # os.access проверяет права текущего пользователя
-            storage_ok = os.access(storage_root, os.W_OK)
-        except Exception:
-            storage_ok = False
-
-    if storage_ok:
+        # 2. Можно создать Xant?
         try:
             os.makedirs(preferred, exist_ok=True)
-            # Финальная проверка: реально ли можно писать в Xant
-            if os.access(preferred, os.W_OK):
-                return (preferred, "storage доступен — использую ~/storage/downloads/Xant")
         except Exception as e:
             _log(f"[download-dir] не удалось создать {preferred}: {e} — fallback")
+            preferred = None
 
+        # 3. Можно реально писать в Xant?
+        if preferred is not None:
+            if _can_write(preferred):
+                return (
+                    preferred,
+                    "storage доступен — использую ~/storage/downloads/Xant",
+                )
+            _log(
+                f"[download-dir] {preferred} существует, но запись не удалась "
+                f"— fallback рядом со скриптом"
+            )
+    else:
+        _log(f"[download-dir] {storage_root} не найден — fallback рядом со скриптом")
+
+    # Fallback
     fallback = os.path.join(BASE_DIR, "downloads")
     os.makedirs(fallback, exist_ok=True)
-    if storage_ok:
-        reason = "storage доступен, но Xant создать не удалось — fallback рядом со скриптом"
-    elif os.path.isdir(storage_root):
-        reason = "нет прав на запись в ~/storage/downloads — fallback рядом со скриптом"
+    if not _can_write(fallback):
+        # Совсем плохо — но лучше явно упасть, чем работать с нерабочей папкой
+        raise RuntimeError(
+            f"Не удалось подготовить папку для скачивания: {fallback} "
+            f"(нет прав на запись). Проверьте права и свободное место."
+        )
+
+    if os.path.isdir(storage_root):
+        if os.path.isdir(preferred) if preferred else False:
+            reason = "storage доступен, но Xant недоступен для записи — fallback рядом со скриптом"
+        else:
+            reason = "storage доступен, но Xant создать не удалось — fallback рядом со скриптом"
     else:
         reason = "~/storage/downloads не найден — fallback рядом со скриптом"
     return (fallback, reason)
@@ -78,9 +114,6 @@ def _pick_download_dir() -> tuple[str, str]:
 DOWNLOAD_DIR, _DOWNLOAD_DIR_REASON = _pick_download_dir()
 QUEUE_DIR = os.path.join(DOWNLOAD_DIR, "queues")
 os.makedirs(QUEUE_DIR, exist_ok=True)
-
-print(f"📁 Папка скачивания: {DOWNLOAD_DIR}")
-print(f"   ({_DOWNLOAD_DIR_REASON})")
 
 LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
