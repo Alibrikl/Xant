@@ -6,9 +6,7 @@ import asyncio
 import mimetypes
 import shutil
 import sys
-import select
 import signal as _signal
-import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -23,15 +21,66 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeVideo,
 )
-logger = logging.getLogger("xant")
+
+def _log(msg: str, prefix: str | None = None, level: int = 0):
+    """
+    Единая точка лога. Всё через print.
+    level оставлен для совместимости со старыми вызовами — игнорируется.
+    prefix добавляется к сообщению (например, "[download]").
+    """
+    text = f"{prefix} {msg}" if prefix else msg
+    print(text, flush=True)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ENV_FILE = os.path.join(BASE_DIR, ".env")
-# DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
-DOWNLOAD_DIR = os.path.expanduser("~/storage/downloads/Xant")
+
+# ---------- Выбор папки скачивания ----------
+def _pick_download_dir() -> tuple[str, str]:
+    """
+    Возвращает (download_dir, reason).
+    Приоритет:
+      1. ~/storage/downloads/Xant — если родитель (~/storage/downloads) доступен.
+      2. <BASE_DIR>/downloads    — fallback рядом со скриптом.
+    """
+    storage_root = os.path.expanduser("~/storage/downloads")
+    preferred = os.path.join(storage_root, "Xant")
+
+    # Проверяем, что родительская папка существует и доступна на запись.
+    storage_ok = False
+    if os.path.isdir(storage_root):
+        try:
+            # os.access проверяет права текущего пользователя
+            storage_ok = os.access(storage_root, os.W_OK)
+        except Exception:
+            storage_ok = False
+
+    if storage_ok:
+        try:
+            os.makedirs(preferred, exist_ok=True)
+            # Финальная проверка: реально ли можно писать в Xant
+            if os.access(preferred, os.W_OK):
+                return (preferred, "storage доступен — использую ~/storage/downloads/Xant")
+        except Exception as e:
+            _log(f"[download-dir] не удалось создать {preferred}: {e} — fallback")
+
+    fallback = os.path.join(BASE_DIR, "downloads")
+    os.makedirs(fallback, exist_ok=True)
+    if storage_ok:
+        reason = "storage доступен, но Xant создать не удалось — fallback рядом со скриптом"
+    elif os.path.isdir(storage_root):
+        reason = "нет прав на запись в ~/storage/downloads — fallback рядом со скриптом"
+    else:
+        reason = "~/storage/downloads не найден — fallback рядом со скриптом"
+    return (fallback, reason)
+
+
+DOWNLOAD_DIR, _DOWNLOAD_DIR_REASON = _pick_download_dir()
 QUEUE_DIR = os.path.join(DOWNLOAD_DIR, "queues")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(QUEUE_DIR, exist_ok=True)
+
+print(f"📁 Папка скачивания: {DOWNLOAD_DIR}")
+print(f"   ({_DOWNLOAD_DIR_REASON})")
 
 LIMIT_FREE = 2 * 1024 ** 3
 LIMIT_PREMIUM = 4 * 1024 ** 3
@@ -123,9 +172,7 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
                 await m.delete()
                 break
             except FloodWaitError as fwe:
-                logger.warning(
-                    "[FloodWait] пауза %ss перед удалением", fwe.seconds,
-                )
+                _log(f"[FloodWait] пауза {fwe.seconds}s перед удалением")
                 await asyncio.sleep(fwe.seconds)
             except Exception:
                 break
@@ -136,16 +183,6 @@ def _schedule_delete(*messages, delay: float = CLEANUP_DELAY):
     _pending_deletions.add(task)
     task.add_done_callback(_pending_deletions.discard)
     return task
-
-
-def _log(msg: str, prefix: str | None = None, level: int = logging.INFO):
-    """
-    Совместимая обёртка. Все старые вызовы `_log("...")` работают.
-    `prefix` добавляется к сообщению (например, "[download]").
-    """
-    text = f"{prefix} {msg}" if prefix else msg
-    logger.log(level, text)
-
 
 def _queue_snapshot(q: dict) -> str:
     counts = {}
@@ -293,10 +330,6 @@ def build_filename(message) -> str:
             original = first_line
             source = "message.text"
 
-    _log(
-        f"[build_filename] id={message.id} kind={_detect_kind(message)} "
-        f"source={source!r} original={original!r}"
-    )
 
     # ПАТЧ: «бесполезные» имена (record.ogg, audio.ogg, voice.ogg) —
     # считаем, что оригинала нет. Иначе все файлы будут record.ogg,
@@ -307,10 +340,6 @@ def build_filename(message) -> str:
         _base_norm = re.sub(r"[_\s]*\(\d+\)$", "", _base_norm)
         _base_norm = re.sub(r"_\d+$", "", _base_norm)
         if _base_norm in _USELESS_BASENAMES:
-            _log(
-                f"  [build_filename] «бесполезное» имя {original!r} — "
-                f"считаю, что оригинала нет"
-            )
             original = None
             source = None
 
@@ -435,10 +464,6 @@ async def _find_in_me(display_name: str, file_size: int | None,
     # Возвращаем None — фото отправится, дубли возможны, но не сломается.
     _ext = os.path.splitext(display_name)[1].lower()
     if _ext in PHOTO_EXTS:
-        _log(
-            f"  🔍 _find_in_me({display_name}): фото — "
-            f"поиск по имени не поддерживается, не кэширую"
-        )
         return None
     if not display_name:
         return None
@@ -469,7 +494,6 @@ async def _find_in_me(display_name: str, file_size: int | None,
                     ):
                         matched = True
             if matched:
-                _log(f"  💾 _find_in_me({display_name}): из кэша (id={cached})")
                 return cached
             _find_cache.pop(cache_key, None)
         except Exception:
@@ -501,7 +525,6 @@ async def _find_in_me(display_name: str, file_size: int | None,
 
             if found is not None:
                 _find_cache_put(cache_key, found)
-                _log(f"  💾 _find_in_me({display_name}): найдено id={found} — кэширую")
             else:
                 _log(f"  🔍 _find_in_me({display_name}): не найдено — не кэширую")
             return found
@@ -509,12 +532,9 @@ async def _find_in_me(display_name: str, file_size: int | None,
         except FloodWaitError as fwe:
             attempt += 1
             if attempt > max_retries:
-                _log(f"  ⚠️  _find_in_me({display_name}): FloodWait — сдаюсь")
                 raise
-            _log(f"  ⏳ _find_in_me: FloodWait {fwe.seconds}s — жду")
             await asyncio.sleep(fwe.seconds)
         except Exception as e:
-            _log(f"  ⚠️  _find_in_me({display_name}): {type(e).__name__}: {e}")
             return None
 
 
@@ -688,11 +708,7 @@ def _scan_downloads() -> dict:
         elif status in ("downloaded", "uploading"):
             own_ready.append((qid, it, full))
         else:
-            logger.warning(
-                "файл %s: статус «%s» в JSON, но файл на диске — "
-                "считаю manual",
-                name, status,
-            )
+            _log(f"файл {name}: статус «{status}» в JSON, но файл на диске — считаю manual")
             anomalous_done.append((qid, it, full))
 
     return {
@@ -702,6 +718,88 @@ def _scan_downloads() -> dict:
         "anomalous_done": anomalous_done,
     }
 
+# ---------- Orphan-файлы при запуске ----------
+async def _prompt_orphan_uploads() -> bool:
+    """
+    При запуске проверяет DOWNLOAD_DIR на «осиротевшие» файлы
+    (не привязанные к JSON-очередям) и спрашивает, отправлять ли их в me.
+    Возвращает True, если пользователь согласился.
+    """
+    scan = _scan_downloads()
+    manual_files = scan.get("manual", [])
+
+    if not manual_files:
+        return False
+
+    print("\n" + "=" * 60)
+    print(f"📂 Найдено файлов в папке загрузки: {len(manual_files)}")
+    print(f"   Папка: {DOWNLOAD_DIR}")
+    print("=" * 60)
+
+    answer = await asyncio.to_thread(
+        input,
+        "❓ Отправить эти файлы в «Избранное» (me)? [y/N]: ",
+    )
+    answer = (answer or "").strip().lower()
+    if answer in ("y", "yes", "д", "да"):
+        return True
+
+    print("⏭  Файлы остаются в папке загрузки, отправка пропущена.")
+    return False
+
+
+async def _upload_orphans_directly():
+    """
+    Прямая отправка manual-файлов в me без создания batch.
+    Использует _send_media + дедупликацию через _find_in_me.
+    """
+    scan = _scan_downloads()
+    manual_files = scan.get("manual", [])
+    if not manual_files:
+        return
+
+    for full_path in manual_files:
+        name = os.path.basename(full_path)
+        try:
+            size = os.path.getsize(full_path)
+        except Exception:
+            size = 0
+
+        is_photo = name.lower().endswith(
+            (".jpg", ".jpeg", ".jpe", ".png", ".webp", ".bmp",
+             ".tif", ".tiff", ".heic", ".heif")
+        )
+        if not is_photo:
+            try:
+                found = await _find_in_me(display_name=name, file_size=size)
+            except Exception:
+                found = None
+            if found is not None:
+                _log(
+                    f"✅ {name}: уже в «Избранном» (id={found}) — "
+                    f"удаляю локальный"
+                )
+                try:
+                    os.remove(full_path)
+                except Exception:
+                    pass
+                continue
+
+        try:
+            sent = await _send_media("me", full_path, name)
+            sent_msg = sent[0] if isinstance(sent, list) else sent
+            sent_id = getattr(sent_msg, "id", None)
+            if sent_id is None:
+                _log(f"❌ {name}: send_file вернул id=None — оставляю файл")
+                continue
+            _log(f"📤 {name} ({human_size(size)}) → me (id={sent_id})")
+            try:
+                os.remove(full_path)
+                _log(f"🧹 удалён локальный файл: {name}")
+            except Exception as e:
+                _log(f"⚠️  не удалось удалить {name}: {e}")
+        except Exception as e:
+            _log(f"❌ {name}: {type(e).__name__}: {e} — файл оставлен")
 
 # ---------- Скачивание ----------
 def _cleanup_partial(local_path: str, expected_size: int = 0):
@@ -753,25 +851,15 @@ async def download_with_retry(
         _log(f"[download] TIMEOUT get_messages {chat_id}/{msg_id} (60s)")
         return None
     except ChannelPrivateError:
-        logger.warning(
-            "[download] канал %s приватный или аккаунт не состоит в нём — "
-            "пропуск %s/%s",
-            chat_id, chat_id, msg_id,
-        )
+        _log(f"[download] канал {chat_id} приватный или аккаунт не состоит в нём — пропуск {chat_id}/{msg_id}")
         return None
     except FloodWaitError as fwe:
-        logger.warning(
-            "[download] FloodWait %ss при get_messages — жду",
-            fwe.seconds,
-        )
+        _log(f"[download] FloodWait {fwe.seconds}s при get_messages — жду")
         await asyncio.sleep(fwe.seconds)
         try:
             target_msg = await client.get_messages(chat_id, ids=msg_id)
         except ChannelPrivateError:
-            logger.warning(
-                "[download] канал %s приватный — пропуск %s/%s",
-                chat_id, chat_id, msg_id,
-            )
+            _log(f"[download] канал {chat_id} приватный — пропуск {chat_id}/{msg_id}")
             return None
         except Exception as e:
             _log(f"[download] ошибка при перезапросе: {e}")
@@ -781,11 +869,7 @@ async def download_with_retry(
         return None
 
     if not target_msg or not target_msg.media:
-        logger.warning(
-            "[download] сообщение %s/%s не найдено или не содержит медиа — "
-            "пропуск",
-            chat_id, msg_id,
-        )
+        _log(f"[download] сообщение {chat_id}/{msg_id} не найдено или не содержит медиа — пропуск")
         return None
 
     # ---------- 2. Размер, лимит Telegram и место на диске ----------
@@ -798,11 +882,9 @@ async def download_with_retry(
             # не отправим.
             _limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
             if size_holder["size"] > _limit:
-                logger.warning(
-                    "[limit] %s/%s: %s > %s — пропуск без скачивания",
-                    chat_id, msg_id,
-                    human_size(size_holder["size"]),
-                    human_size(_limit),
+                _log(
+                    f"[limit] {chat_id}/{msg_id}: {human_size(size_holder['size'])} > "
+                    f"{human_size(_limit)} — пропуск без скачивания"
                 )
                 return None
 
@@ -810,14 +892,13 @@ async def download_with_retry(
                 free = shutil.disk_usage(DOWNLOAD_DIR).free
                 need = size_holder["size"] * 1.1
                 if free < need:
-                    logger.warning(
-                        "[disk check] недостаточно места для %s/%s: "
-                        "нужно %s, свободно %s — пропуск",
-                        chat_id, msg_id, human_size(need), human_size(free),
+                    _log(
+                        f"[disk check] недостаточно места для {chat_id}/{msg_id}: "
+                        f"нужно {human_size(need)}, свободно {human_size(free)} — пропуск"
                     )
                     return None
             except Exception as e:
-                logger.warning("[disk check] не удалось проверить место: %s", e)
+                _log(f"[disk check] не удалось проверить место: {e}")
 
     # ---------- 3. Путь ----------
     suggested_filename = build_filename(target_msg)
@@ -933,10 +1014,7 @@ async def download_with_retry(
 
         except FileReferenceExpiredError:
             attempt += 1
-            logger.warning(
-                "[download] ссылка устарела (попытка %s) — перезапрашиваю",
-                attempt,
-            )
+            _log(f"[download] ссылка устарела (попытка {attempt}) — перезапрашиваю")
             _cleanup_partial(
                 local_path,
                 size_holder.get("size", 0) if size_holder else 0,
@@ -988,7 +1066,7 @@ async def download_with_retry(
                 local_path,
                 size_holder.get("size", 0) if size_holder else 0,
             )
-            logger.warning("[FloodWait] ждём %ss", fwe.seconds)
+            _log(f"[FloodWait] ждём {fwe.seconds}s")
             await asyncio.sleep(fwe.seconds)
             continue
 
@@ -1002,9 +1080,9 @@ async def download_with_retry(
 
         except Exception as e:
             attempt += 1
-            logger.warning(
-                "[download_with_retry] %s (попытка %s/%s): %s",
-                type(e).__name__, attempt, max_retries, e,
+            _log(
+                f"[download_with_retry] {type(e).__name__} "
+                f"(попытка {attempt}/{max_retries}): {e}"
             )
             _cleanup_partial(
                 local_path,
@@ -1141,18 +1219,10 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
     name_attr = DocumentAttributeFilename(display_name)
 
     if kind == "photo":
-        _log(
-            f"[_send_media] {display_name}: kind=photo, "
-            f"отправляю как фото"
-        )
         result = await client.send_file(
             chat, path,
             caption=caption,
             progress_callback=progress_cb,
-        )
-        _log(
-            f"[_send_media] {display_name}: send_file вернул "
-            f"type={type(result).__name__!r}, id={getattr(result, 'id', None)!r}"
         )
         if result is None:
             raise RuntimeError(
@@ -1191,12 +1261,6 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             fsize = os.path.getsize(path)
         except Exception:
             fsize = 0
-
-        _log(
-            f"[_send_media] {os.path.basename(path)}: kind=audio, "
-            f"ext={ext_lower}, size={human_size(fsize)}, "
-            f"duration={d}"
-        )
 
         _MIME_BY_EXT = {
             ".mp3": "audio/mpeg",
@@ -1238,13 +1302,6 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             and 0 < d <= 60
             and not _has_meaningful_name
         )
-
-        _log(
-            f"[_send_media] {display_name}: is_voice={is_voice} "
-            f"(base={_base_check!r}, meaningful={_has_meaningful_name}, "
-            f"dur={d})"
-        )
-
         attrs = [
             DocumentAttributeAudio(
                 duration=d,
@@ -1267,7 +1324,6 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
     ext = os.path.splitext(path)[1].lower()
     if ext == ".gif":
         # GIF — как анимация (Telethon сам распознаёт по расширению).
-        _log(f"[_send_media] {display_name}: gif → как анимация")
         result = await client.send_file(
             chat, path,
             attributes=[name_attr],   # ← сохраняем имя для дедупликации
@@ -1275,7 +1331,6 @@ async def _send_media(chat, path: str, display_name: str, progress_cb=None,
             progress_callback=progress_cb,
         )
     else:
-        _log(f"[_send_media] {display_name}: document → force_document=True")
         result = await client.send_file(
             chat, path,
             force_document=True,
@@ -1443,10 +1498,6 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                 try:
                     await client.delete_messages("me", chunk)
                     deleted_ok.update(chunk)
-                    _log(
-                        f"  🗑  удалено пачкой: {len(chunk)} шт. "
-                        f"(ids: {chunk[:10]}{'…' if len(chunk) > 10 else ''})"
-                    )
                 except FloodWaitError as fwe:
                     _log(
                         f"  ⏳ FloodWait {fwe.seconds}s при удалении пачки "
@@ -1456,7 +1507,6 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                     try:
                         await client.delete_messages("me", chunk)
                         deleted_ok.update(chunk)
-                        _log(f"  🗑  удалено после FloodWait: {len(chunk)} шт.")
                     except Exception as e:
                         _log(
                             f"  ❌ повторное удаление не удалось "
@@ -1538,10 +1588,8 @@ async def reconcile_batch(batch_id: int, force: bool = False):
                 if status in ("pending", "downloading", "downloaded", "uploading"):
                     it["status_msg_id"] = msg.id
                     new_status_msgs[key] = msg
-                    _log(f"  ➕ создан статус {tag}: слот/статус {msg.id}")
                 else:
                     it["status_msg_id"] = None
-                    _log(f"  ➕ создан слот {tag}: {msg.id}")
                 _save_queue(batch_id)
 
         batch["status_msgs"] = new_status_msgs
@@ -1611,9 +1659,7 @@ async def request_reconcile(batch_id: int, force: bool = False):
         try:
             await reconcile_batch(batch_id, force=force)
         except Exception:
-            logger.exception(
-                "[request_reconcile] ошибка реконсиляции пачки %s", batch_id,
-            )
+            _log(f"[request_reconcile] ошибка реконсиляции пачки {batch_id}")
         finally:
             state["running"] = False
 
@@ -1694,10 +1740,9 @@ async def process_link(chat_id, msg_id, full_link, batch_id):
             last_pct = st.get("_last_logged_pct", -1)
             if pct - last_pct >= 10 or current == total:
                 st["_last_logged_pct"] = pct
-                logger.info(
-                    "⬇️  [download] %s: %.1f%% (%s / %s)",
-                    full_link, pct,
-                    human_size(current), human_size(total),
+                _log(
+                    f"⬇️  [download] {full_link}: {pct:.1f}% "
+                    f"({human_size(current)} / {human_size(total)})"
                 )
 
             if key in batch["status_msgs"]:
@@ -2161,10 +2206,7 @@ async def _upload_worker(worker_id: int = 0):
                     try:
                         await _maybe_finish_batch(batch_id)
                     except Exception:
-                        logger.exception(
-                            "[_upload_worker #%s] _maybe_finish_batch упал "
-                            "для batch %s", worker_id, batch_id,
-                        )
+                        _log(f"[_upload_worker #{worker_id}] _maybe_finish_batch упал для batch {batch_id}")
 
         except asyncio.CancelledError:
             return
@@ -2373,10 +2415,9 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             last_pct = st.get("_last_logged_pct", -1)
             if pct - last_pct >= 10 or current == total:
                 st["_last_logged_pct"] = pct
-                logger.info(
-                    "📤 [upload] %s: %.1f%% (%s / %s)",
-                    display_name, pct,
-                    human_size(current), human_size(total),
+                _log(
+                    f"📤 [upload] {display_name}: {pct:.1f}% "
+                    f"({human_size(current)} / {human_size(total)})"
                 )
 
             if key in batch["status_msgs"]:
@@ -2614,12 +2655,6 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
 
                 # ПАТЧ 2: воркер прогрессирует — пропускаем.
                 if worker_progressing:
-                    _log(
-                        f"🐕 watchdog: batch #{batch_id} — "
-                        f"upload-воркер прогрессирует "
-                        f"(активность {now - last_activity:.0f}s назад), "
-                        f"{len(candidates)} downloaded в очереди — пропускаем"
-                    )
                     continue
 
                 key = tuple((id(it), it.get("status")) for it in candidates)
@@ -2627,11 +2662,6 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                 if wd.get("key") != key:
                     wd["key"] = key
                     wd["ts"] = now
-                    _log(
-                        f"🐕 watchdog: batch #{batch_id} — "
-                        f"{len(candidates)} элементов ждут отправки. "
-                        f"Дам {interval:.0f}s..."
-                    )
                     continue
                 elapsed = now - wd.get("ts", now)
                 if elapsed < interval:
@@ -3158,10 +3188,7 @@ async def offer_send_downloaded():
     if not items:
         return
 
-    logger.info(
-        "📥 Найдено уже скачанных, но не отправленных файлов: %d — отправляю",
-        len(items),
-    )
+    _log(f"📥 Найдено уже скачанных, но не отправленных файлов: {len(items)} — отправляю")
 
     placed = 0
     failed: list[tuple[int, dict, str]] = []
@@ -3389,9 +3416,9 @@ async def offer_send_downloaded():
             )
             failed.append((qid, it, f"{type(e).__name__}: {e}"))
 
-    logger.info("📤 Поставлено в очередь на отправку: %d", placed)
+    _log(f"📤 Поставлено в очередь на отправку: {placed}")
     if failed:
-        logger.warning("⚠️  Не удалось поставить: %d", len(failed))
+        _log(f"⚠️  Не удалось поставить: {len(failed)}")
     return failed
 
 
@@ -3497,10 +3524,9 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
             last_pct = st.get("_last_logged_pct", -1)
             if pct - last_pct >= 10 or current == total:
                 st["_last_logged_pct"] = pct
-                logger.info(
-                    "📤 [manual upload] %s: %.1f%% (%s / %s)",
-                    display_name, pct,
-                    human_size(current), human_size(total),
+                _log(
+                    f"📤 [manual upload] {display_name}: {pct:.1f}% "
+                    f"({human_size(current)} / {human_size(total)})"
                 )
 
             if key in batch["status_msgs"]:
@@ -3589,7 +3615,7 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
         try:
             await _maybe_finish_batch(batch_id)
         except Exception:
-            logger.exception(
+            _log(f
                 "[_run_manual_upload] _maybe_finish_batch упал для batch %s",
                 batch_id,
             )
@@ -3932,51 +3958,45 @@ async def handle_saved_messages(event):
 
 def _print_scan_summary(scan: dict):
     if scan["manual"]:
-        logger.info(
-            "📂 Найдено файлов без записи в очереди: %d",
-            len(scan["manual"]),
-        )
+        _log(f"📂 Найдено файлов без записи в очереди: {len(scan['manual'])}")
         for f in scan["manual"][:20]:
             try:
                 sz = human_size(os.path.getsize(f))
             except Exception:
                 sz = "?"
-            logger.info("   • %s (%s)", os.path.basename(f), sz)
+            _log(f"   • {os.path.basename(f)} ({sz})")
         if len(scan["manual"]) > 20:
-            logger.info("   … и ещё %d", len(scan["manual"]) - 20)
+            _log(f"   … и ещё {len(scan['manual']) - 20}")
 
     if scan.get("anomalous_done"):
-        logger.info(
-            "📂 Найдено файлов с терминальным статусом в JSON, "
-            "но на диске: %d — проверю в «Избранном»",
-            len(scan["anomalous_done"]),
+        _log(
+            f"📂 Найдено файлов с терминальным статусом в JSON, "
+            f"но на диске: {len(scan['anomalous_done'])} — проверю в «Избранном»"
         )
         for _, it, f in scan["anomalous_done"][:20]:
-            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
+            _log(f"   • {os.path.basename(f)} ← {it['link']}")
         if len(scan["anomalous_done"]) > 20:
-            logger.info("   … и ещё %d", len(scan["anomalous_done"]) - 20)
+            _log(f"   … и ещё {len(scan['anomalous_done']) - 20}")
 
     if scan["own_partial"]:
-        logger.info(
-            "📂 Найдено недокачанных файлов (есть запись в очереди): %d — "
-            "перекачиваю",
-            len(scan["own_partial"]),
+        _log(
+            f"📂 Найдено недокачанных файлов (есть запись в очереди): "
+            f"{len(scan['own_partial'])} — перекачиваю"
         )
         for _, it, f in scan["own_partial"][:20]:
-            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
+            _log(f"   • {os.path.basename(f)} ← {it['link']}")
         if len(scan["own_partial"]) > 20:
-            logger.info("   … и ещё %d", len(scan["own_partial"]) - 20)
+            _log(f"   … и ещё {len(scan['own_partial']) - 20}")
 
     if scan["own_ready"]:
-        logger.info(
-            "📂 Найдено готовых к отправке файлов (есть запись в очереди): "
-            "%d — поставлю в очередь на отправку",
-            len(scan["own_ready"]),
+        _log(
+            f"📂 Найдено готовых к отправке файлов (есть запись в очереди): "
+            f"{len(scan['own_ready'])} — поставлю в очередь на отправку"
         )
         for _, it, f in scan["own_ready"][:20]:
-            logger.info("   • %s ← %s", os.path.basename(f), it["link"])
+            _log(f"   • {os.path.basename(f)} ← {it['link']}")
         if len(scan["own_ready"]) > 20:
-            logger.info("   … и ещё %d", len(scan["own_ready"]) - 20)
+            _log(f"   … и ещё {len(scan['own_ready']) - 20}")
 
 # ---------- Запуск ----------
 async def main():
@@ -3992,7 +4012,7 @@ async def main():
 
     def _request_shutdown(sig_name: str):
         if not shutdown_event.is_set():
-            logger.warning("🛑 Получен %s — завершаю работу...", sig_name)
+            _log(f"🛑 Получен {sig_name} — завершаю работу...")
             shutdown_event.set()
 
     for sig in ("SIGINT", "SIGTERM"):
@@ -4004,6 +4024,7 @@ async def main():
         except (NotImplementedError, AttributeError):
             # Windows: add_signal_handler не поддерживается для SIGTERM
             pass
+
     existing_ids = _list_queue_files()
     if existing_ids:
         batch_counter["id"] = max(existing_ids)
@@ -4011,8 +4032,6 @@ async def main():
 
     # ПАТЧ 8: если JSON-очередей нет (или файлы в downloads/ не упомянуты
     # ни в одной), но файлы на диске есть — создаём JSON из downloads/.
-    # Это лечит случай, когда queues/ пуста, но downloads/ полна: без JSON
-    # reconcile_batch не работает, и статусы в чате не пересоздаются.
     recovered, skipped = _recover_queues_from_downloads()
     if recovered:
         _log(
@@ -4020,8 +4039,7 @@ async def main():
             f"{recovered} (пропущено, уже в JSON: {skipped})"
         )
 
-    # ПАТЧ 6: сбрасываем upload_retries у downloaded-элементов, чтобы старые
-    # «попытки 1/3» от предыдущих watchdog-срабатываний не привели к fail.
+    # ПАТЧ 6: сбрасываем upload_retries у downloaded-элементов
     for qid in _list_queue_files():
         q = _load_queue(qid)
         if not q:
@@ -4040,9 +4058,7 @@ async def main():
                 f"downloaded-элементов (были ложные инкременты watchdog)"
             )
 
-    # ПАТЧ 9: реабилитируем fail-элементы, у которых файл есть на диске.
-    # Если fail из-за прошлой ошибки (ValueError и т.п.), но локальный файл
-    # цел — ставим downloaded, чтобы _upload_worker переотправил.
+    # ПАТЧ 9: реабилитируем fail-элементы, у которых файл есть на диске
     for qid in _list_queue_files():
         q = _load_queue(qid)
         if not q:
@@ -4053,7 +4069,6 @@ async def main():
                 continue
             lf = it.get("local_file")
             if not lf:
-                # fail без local_file — файла нет, нечего восстанавливать
                 continue
             full_path = os.path.join(DOWNLOAD_DIR, lf)
             if not os.path.exists(full_path):
@@ -4064,7 +4079,6 @@ async def main():
             except Exception:
                 actual = 0
             if expected > 0 and actual < expected:
-                # частичный файл — не восстанавливаем
                 _log(
                     f"  ⚠️  #{qid} {lf}: fail, но файл частичный "
                     f"({human_size(actual)} из {human_size(expected)}) — пропуск"
@@ -4081,9 +4095,8 @@ async def main():
         if revived:
             queues[qid] = q
             _save_queue(qid)
-    # ПАТЧ A: чистим next_retry_ts у терминальных статусов (done/fail/skip).
-    # next_retry_ts остаётся в JSON после успешной отправки или fail —
-    # это мусор, который не читается, но засоряет файл очереди.
+
+    # ПАТЧ A: чистим next_retry_ts у терминальных статусов
     for qid in _list_queue_files():
         q = _load_queue(qid)
         if not q:
@@ -4141,75 +4154,41 @@ async def main():
 
         _log(f"♻️  {it['link']}: сброшен в pending — будет перекачан")
 
-    manual_send = False
-    if scan["manual"]:
-        # ПАТЧ: таймаут на ввод — 60 секунд, потом считаем «n»
-        _INPUT_TIMEOUT = 60.0
-
-        def _input_with_timeout(prompt: str, timeout: float):
-            if sys.platform != "win32":
-                print(prompt, end="", flush=True)
-                rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-                if rlist:
-                    return sys.stdin.readline().strip()
-                print()
-                return ""
-            # Windows fallback — обычный input (без таймаута)
-            return input(prompt).strip()
-
-        try:
-            ans = (await asyncio.to_thread(
-                _input_with_timeout,
-                "\nОтправить их в Избранное? [y/n, 60s]: ",
-                _INPUT_TIMEOUT,
-            )).lower()
-        except Exception:
-            ans = ""
-        manual_send = ans in ("y", "yes", "да", "д")
-        if not manual_send:
-            logger.info("⏭  Пропущено — спрошу при следующем запуске.")
-
     session_file = os.path.join(BASE_DIR, "user_session.session")
     had_session_file = os.path.exists(session_file)
 
-    logger.info("⏳ Подключение к Telegram...")
+    _log("⏳ Подключение к Telegram...")
     await client.start()
 
     authorized = await client.is_user_authorized()
     if not had_session_file or not authorized:
-        logger.info(
-            "📇 Первый запуск или сессия недействительна — загружаю диалоги..."
-        )
+        _log("📇 Первый запуск или сессия недействительна — загружаю диалоги...")
         await client.get_dialogs()
     else:
-        logger.info("📇 Сессия в порядке — диалоги не перезагружаем.")
+        _log("📇 Сессия в порядке — диалоги не перезагружаем.")
 
-    # ПАТЧ: принудительно загружаем диалоги, чтобы Telethon получил
-    # access_hash для приватных каналов (t.me/c/...). Без этого
-    # скачивание по ID падает с "Could not find the input entity".
     _force_dialogs = os.getenv("FORCE_GET_DIALOGS", "1") == "1"
     if _force_dialogs:
-        logger.info("📇 Принудительная загрузка диалогов (FORCE_GET_DIALOGS=1)...")
+        _log("📇 Принудительная загрузка диалогов (FORCE_GET_DIALOGS=1)...")
         try:
             dialogs = await client.get_dialogs(limit=None)
-            logger.info("📇 Загружено диалогов: %d", len(dialogs))
+            _log(f"📇 Загружено диалогов: {len(dialogs)}")
         except Exception as e:
-            logger.warning("⚠️  get_dialogs упал: %s", e)
+            _log(f"⚠️  get_dialogs упал: {e}")
 
     me = await client.get_me()
     account_state["is_premium"] = bool(getattr(me, "premium", False))
     limit = LIMIT_PREMIUM if account_state["is_premium"] else LIMIT_FREE
-    logger.info(
-        "👤 Аккаунт: @%s (%s)",
-        me.username or me.id,
-        "Premium" if account_state["is_premium"] else "Free",
+    _log(
+        f"👤 Аккаунт: @{me.username or me.id} "
+        f"({'Premium' if account_state['is_premium'] else 'Free'})"
     )
-    logger.info("📦 Лимит на отправку: %s", human_size(limit))
+    _log(f"📦 Лимит на отправку: {human_size(limit)}")
 
     if scan.get("anomalous_done"):
-        logger.info(
-            "🔍 Проверяю %d аномальных файлов в «Избранном»...",
-            len(scan["anomalous_done"]),
+        _log(
+            f"🔍 Проверяю {len(scan['anomalous_done'])} аномальных файлов "
+            f"в «Избранном»..."
         )
         for qid, it, full in scan["anomalous_done"]:
             name = os.path.basename(full)
@@ -4222,17 +4201,16 @@ async def main():
                     display_name=name, file_size=size,
                 )
             except FloodWaitError as fwe:
-                logger.warning(
-                    "⏳ FloodWait %ss при проверке %s — оставляю как manual",
-                    fwe.seconds, name,
+                _log(
+                    f"⏳ FloodWait {fwe.seconds}s при проверке {name} — "
+                    f"оставляю как manual"
                 )
                 await asyncio.sleep(fwe.seconds)
                 scan["manual"].append(full)
                 continue
             except Exception as e:
-                logger.warning(
-                    "⚠️  ошибка проверки %s: %s — оставляю как manual",
-                    name, e,
+                _log(
+                    f"⚠️  ошибка проверки {name}: {e} — оставляю как manual"
                 )
                 scan["manual"].append(full)
                 continue
@@ -4258,21 +4236,16 @@ async def main():
                     _save_queue(qid)
                 try:
                     os.remove(full)
-                    logger.info(
-                        "♻️  %s: уже в «Избранном» (id=%s) — "
-                        "помечен done, файл удалён",
-                        name, found_id,
+                    _log(
+                        f"♻️  {name}: уже в «Избранном» (id={found_id}) — "
+                        f"помечен done, файл удалён"
                     )
                 except Exception as e:
-                    logger.warning("⚠️  не удалось удалить %s: %s", name, e)
+                    _log(f"⚠️  не удалось удалить {name}: {e}")
             else:
-                # ПАТЧ 6: файл есть, но в me нет — помечаем fail в JSON,
-                # чтобы не возвращаться к нему при каждом запуске
-                # (бесконечный цикл anomalous_done).
-                logger.warning(
-                    "📂 %s: в «Избранном» не найден — "
-                    "помечаю fail в JSON (файл оставляю как manual)",
-                    name,
+                _log(
+                    f"📂 {name}: в «Избранном» не найден — "
+                    f"помечаю fail в JSON (файл оставляю как manual)"
                 )
                 q = queues.get(qid) or _load_queue(qid)
                 if q is not None:
@@ -4290,32 +4263,35 @@ async def main():
         asyncio.create_task(link_worker(i + 1))
         for i in range(CONCURRENT_DOWNLOADS)
     ]
-    logger.info("▶ Запущено воркеров скачивания: %d", CONCURRENT_DOWNLOADS)
+    _log(f"▶ Запущено воркеров скачивания: {CONCURRENT_DOWNLOADS}")
 
     upload_workers = [
         asyncio.create_task(_upload_worker(i + 1))
         for i in range(CONCURRENT_UPLOADS)
     ]
-    logger.info(
-        "📤 Запущено upload-воркеров: %d (параллельно, commit по порядку)",
-        CONCURRENT_UPLOADS,
+    _log(
+        f"📤 Запущено upload-воркеров: {CONCURRENT_UPLOADS} "
+        f"(параллельно, commit по порядку)"
     )
 
     watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
-    logger.info("🐕 Запущен watchdog зависших пачек")
+    _log("🐕 Запущен watchdog зависших пачек")
+
+    # ПАТЧ: спросить про файлы в папке загрузки
+    if await _prompt_orphan_uploads():
+        await _upload_orphans_directly()
 
     await resume_pending_queues()
 
     failed_send = await offer_send_downloaded()
 
     if failed_send:
-        logger.warning(
-            "⚠️  ВНИМАНИЕ: %d файлов не удалось поставить в очередь "
-            "на отправку:",
-            len(failed_send),
+        _log(
+            f"⚠️  ВНИМАНИЕ: {len(failed_send)} файлов не удалось поставить "
+            f"в очередь на отправку:"
         )
         for qid, it, reason in failed_send:
-            logger.warning("   • #%s %s: %s", qid, it.get("link", "?"), reason)
+            _log(f"   • #{qid} {it.get('link', '?')}: {reason}")
 
         try:
             lines = [
@@ -4338,23 +4314,19 @@ async def main():
             )
             await client.send_message("me", "\n".join(lines))
         except Exception as e:
-            logger.warning("⚠️  не удалось уведомить в me: %s", e)
+            _log(f"⚠️  не удалось уведомить в me: {e}")
     else:
-        logger.info("✅ Все найденные файлы поставлены в очередь на отправку")
+        _log("✅ Все найденные файлы поставлены в очередь на отправку")
 
     for qid in _list_queue_files():
         _close_queue_if_finished(qid)
 
-    if manual_send:
-        await enqueue_manual_files(scan["manual"])
-
-    logger.info(
-        "🚀 Готово! Каждая ссылка — отдельное сообщение, "
-        "одновременно качается %d, перетусовка: %s. "
-        "Команды: /quit /clear /stats /nome",
-        CONCURRENT_DOWNLOADS,
-        "после закачки всей пачки" if REORDER_AFTER_EACH_FILE
-        else "по завершении пачки",
+    _log(
+        f"🚀 Готово! Каждая ссылка — отдельное сообщение, "
+        f"одновременно качается {CONCURRENT_DOWNLOADS}, "
+        f"перетусовка: "
+        f"{'после закачки всей пачки' if REORDER_AFTER_EACH_FILE else 'по завершении пачки'}. "
+        f"Команды: /quit /clear /stats /nome"
     )
 
     try:
@@ -4368,7 +4340,7 @@ async def main():
             if not t.done():
                 t.cancel()
         await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
-        logger.info("🛑 Завершение работы...")
+        _log("🛑 Завершение работы...")
     finally:
         watchdog_task.cancel()
         for uw in upload_workers:
@@ -4393,22 +4365,12 @@ async def main():
         except Exception:
             pass
 
-
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-    )
-    # Telethon — только WARNING, чтобы не засорять консоль
-    logging.getLogger("telethon").setLevel(logging.WARNING)
-    logging.getLogger("telethon.network").setLevel(logging.WARNING)
 
     # На Windows add_signal_handler не работает — ставим fallback
     if sys.platform == "win32":
         def _win_ctrl_c(signum, frame):
-            logger.warning("🛑 Ctrl+C — завершаю работу...")
+            _log("🛑 Ctrl+C — завершаю работу...")
             try:
                 if shutdown_event is not None and not shutdown_event.is_set():
                     shutdown_event.set()
@@ -4422,6 +4384,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.warning("🛑 Остановлено пользователем (Ctrl+C).")
-    except Exception:
-        logger.exception("❌ КРИТИЧЕСКИЙ СБОЙ")
+        _log("🛑 Остановлено пользователем (Ctrl+C).")
+    except Exception as e:
+        _log(f"❌ КРИТИЧЕСКИЙ СБОЙ: {type(e).__name__}: {e}")
