@@ -180,13 +180,18 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
             continue
         while True:
             try:
-                await m.delete()
+                if isinstance(m, int):
+                    await client.delete_messages("me", [m])
+                else:
+                    await m.delete()
                 break
             except FloodWaitError as fwe:
                 _log(f"[FloodWait] пауза {fwe.seconds}s перед удалением")
                 await asyncio.sleep(fwe.seconds)
-            except Exception:
+            except Exception as e:
+                _log(f"⚠️  [delete_later] не удалось удалить сообщение: {type(e).__name__}: {e}")
                 break
+
 
 def _schedule_delete(*messages, delay: float = CLEANUP_DELAY):
     task = asyncio.create_task(_delete_later(*messages, delay=delay))
@@ -3486,10 +3491,12 @@ async def handle_saved_messages(event):
         )
         _log(summary.replace("\n", " | "))
         try:
-            await event.reply(summary)
+            summary_msg = await event.reply(summary)
+            _schedule_delete(event.message, summary_msg, delay=30)
         except Exception:
-            pass
+            _schedule_delete(event.message, delay=30)
         return
+
 
 
 
@@ -3512,7 +3519,7 @@ async def handle_saved_messages(event):
             f"├ Отправляется в me: **{active_ul}** (ожидают отправки: **{pending_ul}**)\n"
             f"├ Обработано за сессию: **{len(processed)}**"
         )
-        _schedule_delete(event.message.id, msg.id, delay=30)
+        _schedule_delete(event.message, msg, delay=60)
         return
 
     if cmd == "/nome":
@@ -4031,7 +4038,7 @@ async def main():
             f"`/stats` — текущая статистика и очереди"
             
         )
-        _schedule_delete(welcome_msg.id, delay=60)
+        _schedule_delete(welcome_msg, delay=60)
     except Exception as e:
         _log(f"⚠️  Не удалось отправить приветствие в me: {e}")
 
@@ -4066,7 +4073,10 @@ async def main():
                 t.cancel()
             await asyncio.gather(*_pending_manual_uploads, return_exceptions=True)
         if _pending_deletions:
+            for t in list(_pending_deletions):
+                t.cancel()
             await asyncio.gather(*_pending_deletions, return_exceptions=True)
+
         await asyncio.sleep(0.5)
         try:
             await client.disconnect()
