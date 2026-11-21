@@ -4017,6 +4017,26 @@ async def main():
         f"• /stats - покажет статистику\n"
     )
 
+    nome_mode = "ВКЛ (только скачивание)" if account_state.get("download_only") else "ВЫКЛ (скачивание и отправка в me)"
+    try:
+        welcome_msg = await client.send_message(
+            "me",
+            f"🚀 **Xant запущен и готов к работе!**\n"
+            f"• Папка загрузки: `{DOWNLOAD_DIR}`\n"
+            f"• Режим `/nome`: **{nome_mode}**\n\n"
+            f"**Доступные команды:**\n"
+            f"`/nome` — переключить режим без отправки в me\n"
+            f"`/quit` — остановить скрипт"
+            f"`/clear` — остановить всё и очистить очереди + `.part`\n"
+            f"`/stats` — текущая статистика и очереди\n"
+            
+        )
+        _schedule_delete(welcome_msg.id, delay=60)
+    except Exception as e:
+        _log(f"⚠️  Не удалось отправить приветствие в me: {e}")
+
+
+
     try:
         disconnect_task = asyncio.ensure_future(client.disconnected)
         shutdown_task = asyncio.create_task(shutdown_event.wait())
