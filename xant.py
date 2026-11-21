@@ -45,7 +45,6 @@ def _can_write(dir_path: str) -> bool:
             pass
         return False
 
-
 def _pick_download_dir() -> tuple[str, str]:
     storage_root = os.path.expanduser("~/storage/downloads")
     preferred = os.path.join(storage_root, "Xant")
@@ -68,7 +67,6 @@ def _pick_download_dir() -> tuple[str, str]:
     else:
         _log(f"[download-dir] {storage_root} не найден — fallback рядом со скриптом")
 
-    # Fallback
     fallback = os.path.join(BASE_DIR, "downloads")
     os.makedirs(fallback, exist_ok=True)
     if not _can_write(fallback):
@@ -87,26 +85,21 @@ def _pick_download_dir() -> tuple[str, str]:
         reason = "~/storage/downloads не найден — fallback рядом со скриптом"
     return (fallback, reason)
 
-
 DOWNLOAD_DIR, _DOWNLOAD_DIR_REASON = _pick_download_dir()
 QUEUE_DIR = os.path.join(DOWNLOAD_DIR, "queues")
 os.makedirs(QUEUE_DIR, exist_ok=True)
 
 LIMIT_FREE = 2000 * 1024 ** 2     # 2000 МБ
 LIMIT_PREMIUM = 4000 * 1024 ** 2  # 4000 МБ
-
 CONCURRENT_DOWNLOADS = 3
 CONCURRENT_UPLOADS = 3
-
 CLEANUP_DELAY = 10
-
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".oga"}
 PHOTO_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".png", ".webp",
     ".bmp", ".tif", ".tiff", ".heic", ".heif",
 }
-
 _USELESS_BASENAMES = {"record", "audio", "voice", "file", "track", "sound",
     "audio_file", "voice_file", "record_file",
     "telegram_audio", "telegram_voice", "telegram_record",
@@ -147,26 +140,19 @@ LINK_REGEX = re.compile(LINK_PATTERN, re.IGNORECASE)
 
 processed: set[tuple] = set()
 in_progress = {"count": 0}
-
 batches: dict[int, dict] = {}
 batch_counter = {"id": 0}
-
 active_dl_tasks: set[asyncio.Task] = set()
 active_ul_tasks: set[asyncio.Task] = set()
-
 account_state = {"is_premium": False, "download_only": False}
-
 queues: dict[int, dict] = {}
-
 link_queue = None
 batch_create_lock = None
 upload_lock = None
 shutdown_event = None
-
 _pending_deletions: set[asyncio.Task] = set()
 _pending_manual_uploads: set[asyncio.Task] = set()
 
-# ---------- Отложенное удаление ----------
 async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
     if delay > 0:
         await asyncio.sleep(delay)
@@ -187,27 +173,11 @@ async def _delete_later(*messages, delay: float = CLEANUP_DELAY):
                 _log(f"⚠️  [delete_later] не удалось удалить сообщение: {type(e).__name__}: {e}")
                 break
 
-
 def _schedule_delete(*messages, delay: float = CLEANUP_DELAY):
     task = asyncio.create_task(_delete_later(*messages, delay=delay))
     _pending_deletions.add(task)
     task.add_done_callback(_pending_deletions.discard)
     return task
-
-def _queue_snapshot(q: dict) -> str:
-    counts = {}
-    for it in q.get("items", []):
-        s = it.get("status", "?")
-        counts[s] = counts.get(s, 0) + 1
-    if not counts:
-        return "пусто"
-    order = ("pending", "downloading", "downloaded", "uploading",
-             "done", "fail", "skip")
-    parts = [f"{k}={counts[k]}" for k in order if k in counts]
-    for k in counts:
-        if k not in order:
-            parts.append(f"{k}={counts[k]}")
-    return ", ".join(parts)
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 _MULTI_UNDERSCORE = re.compile(r'_+')
@@ -269,19 +239,10 @@ def _detect_kind(message) -> str:
     return "file"
 
 def build_filename(message) -> str:
-    """
-    ПАТЧ: пытаемся получить оригинальное имя файла из разных мест:
-      1. DocumentAttributeFilename.file_name (если отправлен как документ)
-      2. DocumentAttributeAudio.title / performer (ID3-теги)
-      3. message.text (caption) — первая строка, если похоже на имя
-      4. Fallback: record_{id}.ogg / voice_{id}.ogg / file_{id}.ext
-    """
     original = None
-    source = None
 
     if message.file and message.file.name:
         original = message.file.name
-        source = "file.name"
 
     if not original and isinstance(message.media, types.MessageMediaDocument):
         doc = message.media.document
@@ -290,7 +251,6 @@ def build_filename(message) -> str:
                 if isinstance(attr, types.DocumentAttributeFilename):
                     if attr.file_name:
                         original = attr.file_name
-                        source = "DocumentAttributeFilename"
                         break
 
     # 3. DocumentAttributeAudio.title
@@ -301,7 +261,6 @@ def build_filename(message) -> str:
                 if isinstance(attr, types.DocumentAttributeAudio):
                     if attr.title:
                         original = attr.title
-                        source = "DocumentAttributeAudio.title"
                         break
 
     # 4. message.text (caption) — первая строка, если похоже на имя
@@ -325,7 +284,6 @@ def build_filename(message) -> str:
         )
         if _looks_like_filename:
             original = first_line
-            source = "message.text"
 
     if original:
         _base_check, _ = os.path.splitext(original)
@@ -334,20 +292,17 @@ def build_filename(message) -> str:
         _base_norm = re.sub(r"_\d+$", "", _base_norm)
         if _base_norm in _USELESS_BASENAMES:
             original = None
-            source = None
 
     if original:
         base, ext = os.path.splitext(original)
         base = _sanitize(base) or "file"
         ext = _sanitize(ext.lstrip("."))
         ext = f".{ext}" if ext else ""
+        if not ext:
+            ext = _detect_extension(message) or ".bin"
     else:
         base = f"{_detect_kind(message)}_{message.id}"
-        ext = _detect_extension(message)
-
-    if not ext:
         ext = _detect_extension(message) or ".bin"
-
 
     filename = f"{base}{ext}"
     filename = _truncate_to_bytes(filename, _MAX_NAME_BYTES)
@@ -433,19 +388,14 @@ _find_cache: dict[tuple[str, int | None], int] = {}
 _FIND_CACHE_MAX = 1000
 
 def _find_cache_put(key, value):
-    """ПАТЧ: ограничиваем размер _find_cache (FIFO-вытеснение)."""
+
     if len(_find_cache) >= _FIND_CACHE_MAX:
-        # Удаляем первый (самый старый) ключ
         oldest = next(iter(_find_cache))
         _find_cache.pop(oldest, None)
     _find_cache[key] = value
 
 async def _find_in_me(display_name: str, file_size: int | None,
     scan_limit: int = 400, max_retries: int = 2) -> int | None:
-    """
-    Ищет файл в «Избранном» (me) по имени + размеру.
-    Сравниваем ТОЛЬКО видео, аудио и документы.
-    """
     if not display_name:
         return None
 
@@ -518,7 +468,6 @@ def _mark_item(batch_id: int, chat_id, msg_id, **fields):
     if not batches.get(batch_id, {}).get("is_manual"):
         _save_queue(batch_id)
 
-
 def _list_queue_files() -> list[int]:
     ids = []
     if not os.path.isdir(QUEUE_DIR):
@@ -566,7 +515,6 @@ def _scan_downloads() -> dict:
                 qid, it = entry
                 own_partial.append((qid, it, full))
             else:
-                # осиротевший .part — удаляем, к отправке не предлагаем
                 try:
                     os.remove(full)
                     _log(f"[scan] удалён осиротевший .part: {name}")
@@ -583,8 +531,6 @@ def _scan_downloads() -> dict:
         qid, it = entry
         status = it.get("status")
 
-        # ПАТЧ /nome: файлы, скачанные в режиме «только скачивание»,
-        # При следующем запуске предложим их отправить 
         if it.get("download_only"):
             manual.append(full)
             continue
@@ -604,7 +550,6 @@ def _scan_downloads() -> dict:
         "anomalous_done": anomalous_done,
     }
 
-# ---------- Orphan-файлы при запуске ----------
 async def _prompt_orphan_uploads(timeout: float = 30.0) -> bool:
     # При запуске проверяет DOWNLOAD_DIR на файлы и спрашивает, отправлять ли их в me.
     scan = _scan_downloads()
@@ -618,7 +563,6 @@ async def _prompt_orphan_uploads(timeout: float = 30.0) -> bool:
     print(f"   Папка: {DOWNLOAD_DIR}")
     print("=" * 60)
 
-    # Если скрипт запущен в фоне без терминала (nohup, systemd, cron)
     if not sys.stdin or not sys.stdin.isatty():
         print("⏭  Нет интерактивного терминала — отправка пропущена.")
         return False
@@ -645,10 +589,6 @@ async def _prompt_orphan_uploads(timeout: float = 30.0) -> bool:
 
 
 async def _upload_orphans_directly():
-    """
-    Прямая отправка manual-файлов в me без создания batch.
-    Использует _send_media + дедупликацию через _find_in_me.
-    """
     scan = _scan_downloads()
     manual_files = scan.get("manual", [])
     if not manual_files:
@@ -674,8 +614,7 @@ async def _upload_orphans_directly():
             found = None
         if found is not None:
             _log(
-                f"✅ {name}: уже в «Избранном» (id={found}) — "
-                f"удаляю локальный"
+                f"✅ {name}: уже в «Избранном» (id={found}) — удаляю локальный"
             )
             try:
                 os.remove(full_path)
@@ -697,8 +636,6 @@ async def _upload_orphans_directly():
             except Exception as e:
                 _log(f"⚠️  не удалось удалить {name}: {e}")
         except FloodWaitError as fwe:
-            # ПАТЧ: FloodWait — не ошибка, а троттлинг Telegram.
-            # Файл оставляем в downloads/, при следующем запуске спросим снова.
             _log(
                 f"⏳ {name}: FloodWait {fwe.seconds}s при отправке — "
                 f"файл оставлен, повтор при следующем запуске"
@@ -708,11 +645,9 @@ async def _upload_orphans_directly():
             _log(f"❌ {name}: {type(e).__name__}: {e} — файл оставлен")
 
 def _cleanup_partial(local_path: str, expected_size: int = 0):
-    # Удаляет недокачанный файл: X.part и/или X, если X меньше expected_size.
     if not local_path:
         return False
 
-    # Нормализация: если передали "X.part", работаем с "X"
     if local_path.endswith(".part"):
         local_path = local_path[:-5]
 
@@ -725,11 +660,8 @@ def _cleanup_partial(local_path: str, expected_size: int = 0):
                 actual = os.path.getsize(path)
                 is_part = path.endswith(".part")
                 if actual >= expected_size and not is_part:
-                    # целый финальный файл — не трогаем
                     continue
-                # .part больше expected_size — тоже битый, удаляем
             else:
-                # размер неизвестен — трогаем только .part
                 if not path.endswith(".part"):
                     continue
             os.remove(path)
@@ -1203,7 +1135,6 @@ def _render_status(st: dict, full_link: str,
         )
     return f"📋 {full_link}"
 
-
 def _initial_status_text(it: dict) -> str:
     link = it.get("link", "")
     status = it.get("status", "pending")
@@ -1218,7 +1149,6 @@ def _initial_status_text(it: dict) -> str:
         "file_size": _fsize,
         "up_percent": 0.0,
     }
-    # ПАТЧ 4: статус из JSON — источник истины
     return _render_status(st_stub, link, force_status=status)
 
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
@@ -1278,7 +1208,6 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
                 f"{type(e).__name__}: {e}"
             )
 
-# ---------- Хелпер ----------
 def _release_processed(key: tuple, result: str) -> str:
     processed.discard(key)
     return result
@@ -1333,7 +1262,6 @@ async def process_link(chat_id, msg_id, link: str, batch_id: int) -> str:
             loop.create_task(_update_status_msg(batch, key, link))
 
     try:
-        # 1. Проверяем, не скачан ли файл уже полностью на диск
         filename = None
         if existing_local:
             candidate = os.path.join(DOWNLOAD_DIR, existing_local)
@@ -1354,8 +1282,6 @@ async def process_link(chat_id, msg_id, link: str, batch_id: int) -> str:
         final_size = size_holder.get("actual") or (
             os.path.getsize(filename) if os.path.exists(filename) else 0
         )
-
-        # 2. Режим /nome — оставляем файл в папке загрузки, в me не отправляем
         if download_only:
             _mark_item(
                 batch_id, chat_id, msg_id,
@@ -1483,8 +1409,6 @@ async def link_worker(worker_id: int):
                 pass
         await _maybe_finish_batch(batch_id)
 
-
-
 async def _maybe_finish_batch(batch_id: int):
     b = batches.get(batch_id)
     if b is None:
@@ -1575,7 +1499,6 @@ async def _maybe_finish_batch(batch_id: int):
 
     _log(f"batch #{batch_id}: пачка закрыта и удалена из памяти")
 
-
 # ---------- Upload worker ----------
 async def _upload_worker(worker_id: int = 0):
     UPLOAD_POLL_INTERVAL = 1.0
@@ -1591,10 +1514,6 @@ async def _upload_worker(worker_id: int = 0):
                 if b.get("is_manual"):
                     continue
 
-                # свободный порядок — берём ЛЮБОЙ downloaded,
-                # не занятый другими воркерами и не в processed.
-                # pending/downloading/uploading — просто пропускаем,
-                # НЕ ставим барьер. Файлы в чате — по готовности.
                 target = None
                 failed_missing = False
 
@@ -1604,18 +1523,13 @@ async def _upload_worker(worker_id: int = 0):
                         continue
                     key = (it["chat_id"], it["msg_id"])
 
-                    # Занят process_link'ом — пропускаем
                     if key in processed:
                         continue
-                    # Занят другим upload-воркером — пропускаем
                     if key in b.get("_uploading", set()):
                         continue
-                    # pending / downloading / uploading — не барьер, пропускаем
                     if status != "downloaded":
                         continue
 
-                    # status == "downloaded" — берём
-                    # ПАТЧ: уважаем next_retry_ts (FloodWait)
                     retry_ts = it.get("next_retry_ts", 0)
                     if retry_ts and time.time() < retry_ts:
                         continue
@@ -1709,17 +1623,14 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     full_link = it["link"]
     local_name = it.get("local_file")
 
-    # heartbeat — воркер начал работу над элементом.
     batch["_last_upload_activity_ts"] = time.time()
 
     key = (chat_id, msg_id)
 
-    # batch отменён через /clear — не отправляем
     if batch.get("cancelled"):
         _log(f"  ⏭  upload-воркер: {full_link}: batch отменён — пропуск")
         return "deferred"
 
-    # ПАТЧ если process_link уже взял элемент — НЕ отправляем параллельно.
     if key in processed:
         _log(
             f"  ⏭  upload-воркер: {full_link}: уже в processed "
@@ -1804,10 +1715,6 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
         await _update_status_msg(batch, key, full_link, force=True)
         return "skip"
 
-
-    # ПАТЧ проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
-    # Если да — НЕ ставим uploading (📤 не мигнёт), сразу done + ✅.
-    # ПАТЧ: для фото _find_in_me не работает (нет file.name) — пропускаем.
     _is_photo = display_name.lower().endswith(
         (".jpg", ".jpeg", ".jpe", ".png", ".webp", ".bmp",
          ".tif", ".tiff", ".heic", ".heif")
@@ -1936,8 +1843,6 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             f"⏳ upload-воркер: {full_link}: FloodWait {fwe.seconds}s "
             f"— откладываю до {time.strftime('%H:%M:%S', time.localtime(time.time() + fwe.seconds))}"
         )
-        # ПАТЧ: НЕ спим в воркере — сохраняем next_retry_ts в item.
-        # Воркер освобождается и берёт другие downloaded-элементы.
         batch["_last_upload_activity_ts"] = time.time()
         _mark_item(
             batch_id, chat_id, msg_id,
@@ -2138,7 +2043,6 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
                 if not candidates:
                     continue
 
-                # воркер прогрессирует — пропускаем.
                 if worker_progressing:
                     continue
 
@@ -2593,9 +2497,7 @@ async def resume_pending_queues():
                 _log(
                     f"  📤 #{qid}: поставлено pending в очередь: {placed}"
                 )
-
         _close_queue_if_finished(qid)
-
 
 def _close_queue_if_finished(qid: int) -> bool:
     b = batches.get(qid)
@@ -2664,7 +2566,6 @@ async def offer_send_downloaded():
     items = _find_downloaded_items()
     if not items:
         return []
-
     _log(f"📥 Найдено уже скачанных, но не отправленных файлов: {len(items)} — передаю в отправку")
 
     ready_count = 0
@@ -2921,7 +2822,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
         await _update_status_msg(batch, key, full_link, force=True)
         return True
 
-
     # проверяем, есть ли файл уже в «Избранном» ДО _update_status_msg.
     try:
         found_id = await _find_in_me(
@@ -2964,7 +2864,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
         else:
             _mark_item(batch_id, chat_id, msg_id,
                        status_msg_id=None)
-
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -2974,7 +2873,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
 
         return True
 
-    # Не найден — ставим uploading и отправляем
     st["status"] = "uploading"
     st["up_current"] = 0
     st["up_total"] = file_size
@@ -3016,8 +2914,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
             caption=manual_caption,
         )
     except FloodWaitError as fwe:
-        # ПАТЧ: FloodWait — не fail, а deferred. Файл оставляем,
-        # статус → downloaded, next_retry_ts — через fwe.seconds.
         _log(
             f"⏳ manual: {display_name}: FloodWait {fwe.seconds}s — "
             f"deferred (файл оставлен)"
@@ -3033,7 +2929,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
 
     sent_msg = sent[0] if isinstance(sent, list) else sent
     sent_id = getattr(sent_msg, "id", None)
-
     _log(
         f"✅ Файл загружен в «Избранное»: {display_name} "
         f"→ сообщение id={sent_id}, размер={human_size(file_size)}"
@@ -3070,7 +2965,6 @@ async def upload_manual_file(batch_id: int, item: dict, path: str) -> bool:
         _log(f"⚠️  не удалось удалить {display_name}: {e}")
 
     return True
-
 
 async def _run_manual_upload(batch_id: int, item: dict, path: str):
     key = (item["chat_id"], item["msg_id"])
@@ -3109,7 +3003,6 @@ async def _run_manual_upload(batch_id: int, item: dict, path: str):
                 f"[_run_manual_upload] _maybe_finish_batch упал "
                 f"для batch {batch_id}"
             )
-
 
 async def enqueue_manual_files(paths: list[str]):
     if not paths:
@@ -3176,7 +3069,6 @@ async def enqueue_manual_files(paths: list[str]):
             task = asyncio.create_task(_run_manual_upload(batch_id, it, p))
             _pending_manual_uploads.add(task)
             task.add_done_callback(_pending_manual_uploads.discard)
-
 
 # ---------- Обработчик сообщений ----------
 @client.on(events.NewMessage(chats="me"))
@@ -3293,9 +3185,6 @@ async def handle_saved_messages(event):
         except Exception:
             _schedule_delete(event.message, delay=30)
         return
-
-
-
 
     if cmd == "/stats":
         nome_status = "🟢 ВКЛ" if account_state.get("download_only") else "🔴 ВЫКЛ"
