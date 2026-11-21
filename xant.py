@@ -4054,7 +4054,7 @@ async def main():
             if not t.done():
                 t.cancel()
         await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
-        _log("🛑 Завершение работы...")
+        _log("🛑 Работа прекращена.")
     finally:
         watchdog_task.cancel()
         for uw in upload_workers:
