@@ -1578,12 +1578,12 @@ async def process_link(chat_id, msg_id, link: str, batch_id: int) -> str:
             if status_msg is not None:
                 try:
                     await status_msg.edit(
-                        f"✅ {base_name} ({human_size(final_size)}) — скачано (/nome)"
+                        f"✅ {base_name} ({human_size(final_size)})"
                     )
                 except Exception:
                     pass
             _log(
-                f"✅ [{batch_id}] скачано без отправки (/nome): "
+                f"✅ [{batch_id}] скачано без отправки: "
                 f"{base_name} ({human_size(final_size)})"
             )
             return _release_processed(key, "ok")
@@ -1746,10 +1746,17 @@ async def _maybe_finish_batch(batch_id: int):
         f"total={b['total']}"
     )
 
-    try:
-        await request_reconcile(batch_id, force=True)
-    except Exception as e:
-        _log(f"batch #{batch_id}: ошибка перетусовки: {e}")
+    is_nome = bool(
+        b.get("download_only")
+        or account_state.get("download_only")
+        or (q is not None and all(it.get("download_only") for it in q.get("items", [])))
+    )
+    if not is_nome:
+        try:
+            await request_reconcile(batch_id, force=True)
+        except Exception as e:
+            _log(f"batch #{batch_id}: ошибка перетусовки: {e}")
+
 
     if not b.get("is_manual") and (b["fail"] > 0 or b["skip"] > 0):
         try:
@@ -1964,20 +1971,14 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     display_name = os.path.basename(filename)
     file_size = it.get("file_size") or os.path.getsize(filename)
 
-    # ПАТЧ /nome: режим «только скачать» — файл остаётся в downloads/,
-    # в me не отправляем. Ставим done, но сохраняем local_file,
-    # чтобы пользователь мог забрать файл вручную и/или при выключении
-    # режима файл не потерялся.
     if account_state.get("download_only"):
         _log(
-            f"📥 /nome: {full_link}: только скачивание — "
-            f"в me не отправляю (файл остаётся в downloads/)"
+            f"📥 /nome: {full_link}: только скачивание"
         )
         _mark_item(
             batch_id, chat_id, msg_id,
             status="done",
             file_message_id=None,
-            # local_file НЕ обнуляем — файл остаётся на диске
             downloaded_at=time.time(),
             download_only=True,    
             upload_retries=0,
@@ -1989,8 +1990,7 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
         if status_msg is not None:
             try:
                 await status_msg.edit(
-                    f"✅ {display_name} ({human_size(file_size)}) — "
-                    f"скачано (только downloads/, /nome)"
+                    f"✅ {display_name} ({human_size(file_size)})"
                 )
                 _mark_item(batch_id, chat_id, msg_id,
                            status_msg_id=None, slot_msg_id=None)
