@@ -20,7 +20,9 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
 )
 import logging
-
+from datetime import datetime, timezone
+_processed_clear_ids: set[int] = set()
+_script_start_time = datetime.now(timezone.utc)
 def _log(msg: str):
     print(msg, flush=True)
 
@@ -616,10 +618,6 @@ def _cleanup_partial(local_path: str, expected_size: int = 0):
     return removed
 
 async def _ensure_connected(check_interval: float = 4.0) -> bool:
-    """
-    Ждёт реального восстановления интернета и переподключает Telethon.
-    Возвращает True, если был обрыв связи.
-    """
     was_offline = False
     while True:
         try:
@@ -627,6 +625,8 @@ async def _ensure_connected(check_interval: float = 4.0) -> bool:
                 await asyncio.wait_for(client.connect(), timeout=8.0)
             # Реальная проверка прохождения трафика до серверов Telegram (обходит заглушки VPN)
             await asyncio.wait_for(client.get_me(), timeout=8.0)
+            # Подтягиваем пропущенные за время оффлайна сообщения и обновления
+            await asyncio.wait_for(client.catch_up(), timeout=10.0)
             if was_offline:
                 _log("🌐 Связь с Telegram восстановлена — продолжаю докачку...")
             return was_offline
@@ -1503,7 +1503,10 @@ async def link_worker(worker_id: int):
             finally:
                 active_dl_tasks.discard(task)
         except asyncio.CancelledError:
-            _log(f"🛑 [worker-{worker_id}] скачивание прервано по /clear: {full_link}")
+            if shutdown_event.is_set():
+                _log(f"🛑 [worker-{worker_id}] скачивание остановлено (завершение работы): {full_link}")
+            else:
+                _log(f"🛑 [worker-{worker_id}] скачивание прервано по /clear: {full_link}")
             continue
         except Exception as e:
             _log(f"⚠️  [worker-{worker_id}] неожиданное исключение: {e}")
@@ -2592,6 +2595,19 @@ async def handle_saved_messages(event):
         return
     
     if cmd == "/clear":
+
+        msg = event.message
+        if not msg or msg.id in _processed_clear_ids:
+            return
+        # 1. Игнорируем команды, отправленные ДО запуска скрипта
+        if msg.date < _script_start_time:
+            return
+        # 2. Игнорируем старые сообщения (старше 30 сек), прилетевшие при реконнекте
+        age_seconds = (datetime.now(timezone.utc) - msg.date).total_seconds()
+        if age_seconds > 30:
+            return
+        _processed_clear_ids.add(msg.id)
+        
         _log("🧹 Получена команда /clear — полная остановка и очистка...")
 
         drained = 0
@@ -3166,16 +3182,7 @@ async def main():
         _log(f"⚠️  Не удалось отправить приветствие в me: {e}")
 
     try:
-        disconnect_task = asyncio.ensure_future(client.disconnected)
-        shutdown_task = asyncio.create_task(shutdown_event.wait())
-        await asyncio.wait(
-            [disconnect_task, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in (disconnect_task, shutdown_task):
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(disconnect_task, shutdown_task, return_exceptions=True)
+        await shutdown_event.wait()
         _log("🛑 Работа прекращена.")
     finally:
         watchdog_task.cancel()
