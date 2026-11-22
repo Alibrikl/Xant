@@ -628,13 +628,13 @@ async def _ensure_connected(check_interval: float = 4.0) -> bool:
             # Подтягиваем пропущенные за время оффлайна сообщения и обновления
             await asyncio.wait_for(client.catch_up(), timeout=10.0)
             if was_offline:
-                _log("🌐 Связь с Telegram восстановлена — продолжаю докачку...")
+                _log("🌐 Связь восстановлена — продолжаю работу...")
             return was_offline
         except asyncio.CancelledError:
             raise
         except Exception:
             if not was_offline:
-                _log("📡 Пропал интернет — жду восстановления связи с Telegram...")
+                _log("📡 Пропал интернет — жду восстановления связи...")
                 was_offline = True
             try:
                 if client.is_connected():
@@ -644,7 +644,6 @@ async def _ensure_connected(check_interval: float = 4.0) -> bool:
             await asyncio.sleep(check_interval)
 
 class StatusThrottler:
-    """Ограничивает частоту редактирования статусного сообщения в Telegram."""
 
     def __init__(self, min_interval: float = 3.5):
         self.min_interval = min_interval
@@ -653,22 +652,15 @@ class StatusThrottler:
         self._lock = asyncio.Lock()
 
     async def edit(self, status_msg, text: str, force: bool = False):
-        """
-        Редактирует сообщение не чаще раза в min_interval секунд.
-        Если force=True (для финальных статусов 100% / Ошибка), ждёт окончания кулдауна и отправляет.
-        """
         if not status_msg or text == self._last_text:
             return
-
         async with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_edit
 
             if elapsed < self.min_interval:
                 if not force:
-                    # Пропускаем промежуточный кадр прогресса (например, 12%, 13%)
                     return
-                # Для финального статуса ждём остаток паузы, чтобы гарантированно обновить текст
                 await asyncio.sleep(self.min_interval - elapsed)
 
             if text == self._last_text:
@@ -679,14 +671,12 @@ class StatusThrottler:
                 self._last_edit = time.monotonic()
                 self._last_text = text
             except FloodWaitError as e:
-                # Если Telegram всё же попросил подождать — сдвигаем таймер вперёд
                 self._last_edit = time.monotonic() + int(e.seconds)
             except Exception as e:
-                # При обрыве сети или 429 увеличиваем интервал, чтобы не спамить в лог
                 self._last_edit = time.monotonic() + self.min_interval
                 _log(f"[status] edit пропущен: {type(e).__name__}: {e}")
 
-throttler = StatusThrottler(min_interval=4.0)  # Не чаще 1 раза в 4 секунды
+throttler = StatusThrottler(min_interval=4.0) 
 
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
@@ -886,10 +876,8 @@ async def download_with_retry(
             attempt = max(0, attempt - 1)
 
         except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as e:
-            # Сбрасываем зависшее соединение и ждём реального ответа от серверов Telegram
             had_outage = await _ensure_connected()
             if had_outage:
-                # Интернет пропадал — не тратим попытку и продолжаем докачку
                 attempt = max(0, attempt - 1)
                 continue
 
