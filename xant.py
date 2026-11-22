@@ -19,6 +19,7 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeVideo,
 )
+import logging
 
 def _log(msg: str):
     print(msg, flush=True)
@@ -111,6 +112,17 @@ load_dotenv()
 try:
     API_ID = int(os.getenv("TELEGRAM_API_ID"))
     API_HASH = os.getenv("TELEGRAM_API_HASH")
+    # Глушим бесконечный спам переподключений Telethon при обрыве сети
+    logging.getLogger("telethon").setLevel(logging.CRITICAL)
+    client = TelegramClient(
+        os.path.join(BASE_DIR, "user_session"),
+        API_ID,
+        API_HASH,
+        connection_retries=3,
+        retry_delay=2,
+        timeout=30,
+    )
+
 except (TypeError, ValueError):
     print("❌ Ошибка: Неверный TELEGRAM_API_ID в файле .env.")
     exit(1)
@@ -608,6 +620,29 @@ def _cleanup_partial(local_path: str, expected_size: int = 0):
             _log(f"[cleanup] не удалось удалить {path}: {e}")
     return removed
 
+async def _wait_for_network(check_interval: float = 3.0) -> bool:
+    """Проверяет доступность серверов Telegram. Возвращает True, если пришлось ждать сеть."""
+    waited = False
+    while True:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("149.154.167.50", 443),  # DC2 Telegram
+                timeout=3.0,
+            )
+            writer.close()
+            await writer.wait_closed()
+            if waited:
+                _log("🌐 Сеть восстановлена — продолжаю...")
+            return waited
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not waited:
+                _log("📡 Пропал интернет — жду восстановления сети...")
+                waited = True
+            await asyncio.sleep(check_interval)
+
+
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
     size_holder: dict | None = None, max_retries: int = 3,
@@ -622,6 +657,8 @@ async def download_with_retry(
             wait_s = int(e.seconds) + 2
             _log(f"⏳ FloodWait при get_entity({chat_id}) — ждём {wait_s} сек...")
             await asyncio.sleep(wait_s)
+        except Exception:
+            await _wait_for_network()
 
     while True:
         try:
@@ -631,6 +668,8 @@ async def download_with_retry(
             wait_s = int(e.seconds) + 2
             _log(f"⏳ FloodWait при get_messages({msg_id}) — ждём {wait_s} сек...")
             await asyncio.sleep(wait_s)
+        except Exception:
+            await _wait_for_network()
 
     if not target_msg:
         raise ValueError(f"Сообщение {msg_id} не найдено")
@@ -669,6 +708,9 @@ async def download_with_retry(
 
     attempt = 0
     flood_attempts = 0
+    CHUNK_ALIGN = 4096           # Обязательное выравнивание offset в Telegram API
+    CHUNK_SIZE = 512 * 1024      # 512 КБ — стабильно для мобильного интернета
+
     while True:
         attempt += 1
         try:
@@ -692,13 +734,31 @@ async def download_with_retry(
                         task_to_cancel.cancel()
                         return
 
-            dl_task = asyncio.create_task(
-                client.download_media(
-                    target_msg,
-                    file=part_path,
-                    progress_callback=wrapped_progress,
-                )
-            )
+            async def _stream_download():
+                current_offset = 0
+                if os.path.exists(part_path):
+                    raw_size = os.path.getsize(part_path)
+                    # Выравниваем хвост файла до 4096 байт, чтобы Telegram не вернул OFFSET_INVALID
+                    current_offset = (raw_size // CHUNK_ALIGN) * CHUNK_ALIGN
+
+                mode = "r+b" if current_offset > 0 else "wb"
+                with open(part_path, mode) as f:
+                    if current_offset > 0:
+                        f.truncate(current_offset)
+                        f.seek(current_offset)
+                        wrapped_progress(current_offset, expected_size)
+
+                    async for chunk in client.iter_download(
+                        target_msg.media,
+                        offset=current_offset,
+                        chunk_size=CHUNK_SIZE,
+                    ):
+                        f.write(chunk)
+                        current_offset += len(chunk)
+                        wrapped_progress(current_offset, expected_size)
+                return part_path
+
+            dl_task = asyncio.create_task(_stream_download())
             wd_task = asyncio.create_task(_watchdog(dl_task))
             try:
                 saved_path = await dl_task
@@ -714,7 +774,7 @@ async def download_with_retry(
                     pass
 
             if not saved_path or not os.path.exists(saved_path):
-                raise RuntimeError("download_media не вернул файл")
+                raise RuntimeError("Скачивание не создало файл")
 
             actual_size = os.path.getsize(saved_path)
             exp = (size_holder.get("expected") if size_holder else 0) or expected_size
@@ -735,18 +795,6 @@ async def download_with_retry(
         except asyncio.CancelledError:
             raise
 
-        except asyncio.TimeoutError:
-            if attempt >= max_retries:
-                raise RuntimeError(
-                    f"Скачивание зависло (таймаут 15с) после {max_retries} попыток"
-                )
-            delay = min(5 * (2 ** (attempt - 1)), 60)
-            _log(
-                f"⏳ таймаут скачивания ({attempt}/{max_retries}), "
-                f"докачка через {delay} сек..."
-            )
-            await asyncio.sleep(delay)
-
         except FloodWaitError as e:
             flood_attempts += 1
             if flood_attempts > 10:
@@ -760,6 +808,7 @@ async def download_with_retry(
 
         except FileReferenceExpiredError:
             _log(f"🔄 Истёк file_reference для msg_id={msg_id}, обновляем сообщение...")
+            await _wait_for_network()
             old_local_path = local_path
             target_msg = await client.get_messages(channel, ids=msg_id)
             if not target_msg or not target_msg.media:
@@ -784,13 +833,23 @@ async def download_with_retry(
                         on_path_known(local_path)
                     except Exception:
                         pass
+            attempt = max(0, attempt - 1)
 
-        except Exception as e:
+        except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as e:
+            # Сначала проверяем, не пропал ли интернет
+            had_outage = await _wait_for_network()
+            if had_outage:
+                # Если сети реально не было — не тратим счётчик попыток и сразу докачиваем
+                attempt = max(0, attempt - 1)
+                continue
+
             if attempt >= max_retries:
-                raise
+                raise RuntimeError(
+                    f"Скачивание сорвалось после {max_retries} попыток: {type(e).__name__}: {e}"
+                )
             delay = min(5 * (2 ** (attempt - 1)), 60)
             _log(
-                f"⚠️  ошибка скачивания ({attempt}/{max_retries}): "
+                f"⚠️  обрыв скачивания ({attempt}/{max_retries}): "
                 f"{type(e).__name__}: {e} — докачка через {delay} сек"
             )
             await asyncio.sleep(delay)
