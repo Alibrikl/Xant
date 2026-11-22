@@ -118,19 +118,14 @@ try:
         os.path.join(BASE_DIR, "user_session"),
         API_ID,
         API_HASH,
-        connection_retries=3,
-        retry_delay=2,
+        connection_retries=None,
+        retry_delay=5,
         timeout=30,
     )
 
 except (TypeError, ValueError):
     print("❌ Ошибка: Неверный TELEGRAM_API_ID в файле .env.")
     exit(1)
-
-client = TelegramClient(
-    os.path.join(BASE_DIR, "user_session"), API_ID, API_HASH,
-    connection_retries=10, retry_delay=3, timeout=60,
-)
 
 LINK_PATTERN = r"https://t\.me/(?:c/(\d+)|([\w_]+))/(\d+)"
 LINK_REGEX = re.compile(LINK_PATTERN, re.IGNORECASE)
@@ -620,28 +615,78 @@ def _cleanup_partial(local_path: str, expected_size: int = 0):
             _log(f"[cleanup] не удалось удалить {path}: {e}")
     return removed
 
-async def _wait_for_network(check_interval: float = 3.0) -> bool:
-    """Проверяет доступность серверов Telegram. Возвращает True, если пришлось ждать сеть."""
-    waited = False
+async def _ensure_connected(check_interval: float = 4.0) -> bool:
+    """
+    Ждёт реального восстановления интернета и переподключает Telethon.
+    Возвращает True, если был обрыв связи.
+    """
+    was_offline = False
     while True:
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection("149.154.167.50", 443),  # DC2 Telegram
-                timeout=3.0,
-            )
-            writer.close()
-            await writer.wait_closed()
-            if waited:
-                _log("🌐 Сеть восстановлена — продолжаю...")
-            return waited
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=8.0)
+            # Реальная проверка прохождения трафика до серверов Telegram (обходит заглушки VPN)
+            await asyncio.wait_for(client.get_me(), timeout=8.0)
+            if was_offline:
+                _log("🌐 Связь с Telegram восстановлена — продолжаю докачку...")
+            return was_offline
         except asyncio.CancelledError:
             raise
         except Exception:
-            if not waited:
-                _log("📡 Пропал интернет — жду восстановления сети...")
-                waited = True
+            if not was_offline:
+                _log("📡 Пропал интернет — жду восстановления связи с Telegram...")
+                was_offline = True
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
             await asyncio.sleep(check_interval)
 
+class StatusThrottler:
+    """Ограничивает частоту редактирования статусного сообщения в Telegram."""
+
+    def __init__(self, min_interval: float = 3.5):
+        self.min_interval = min_interval
+        self._last_edit: float = 0.0
+        self._last_text: str = ""
+        self._lock = asyncio.Lock()
+
+    async def edit(self, status_msg, text: str, force: bool = False):
+        """
+        Редактирует сообщение не чаще раза в min_interval секунд.
+        Если force=True (для финальных статусов 100% / Ошибка), ждёт окончания кулдауна и отправляет.
+        """
+        if not status_msg or text == self._last_text:
+            return
+
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_edit
+
+            if elapsed < self.min_interval:
+                if not force:
+                    # Пропускаем промежуточный кадр прогресса (например, 12%, 13%)
+                    return
+                # Для финального статуса ждём остаток паузы, чтобы гарантированно обновить текст
+                await asyncio.sleep(self.min_interval - elapsed)
+
+            if text == self._last_text:
+                return
+
+            try:
+                await status_msg.edit(text)
+                self._last_edit = time.monotonic()
+                self._last_text = text
+            except FloodWaitError as e:
+                # Если Telegram всё же попросил подождать — сдвигаем таймер вперёд
+                self._last_edit = time.monotonic() + int(e.seconds)
+            except Exception as e:
+                # При обрыве сети или 429 увеличиваем интервал, чтобы не спамить в лог
+                self._last_edit = time.monotonic() + self.min_interval
+                _log(f"[status] edit пропущен: {type(e).__name__}: {e}")
+
+throttler = StatusThrottler(min_interval=4.0)  # Не чаще 1 раза в 4 секунды
 
 async def download_with_retry(
     chat_id, msg_id, progress_callback,
@@ -651,25 +696,31 @@ async def download_with_retry(
 ):
     while True:
         try:
+            await _ensure_connected()
             channel = await client.get_entity(chat_id)
             break
         except FloodWaitError as e:
             wait_s = int(e.seconds) + 2
             _log(f"⏳ FloodWait при get_entity({chat_id}) — ждём {wait_s} сек...")
             await asyncio.sleep(wait_s)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            await _wait_for_network()
+            await asyncio.sleep(3)
 
     while True:
         try:
+            await _ensure_connected()
             target_msg = await client.get_messages(channel, ids=msg_id)
             break
         except FloodWaitError as e:
             wait_s = int(e.seconds) + 2
             _log(f"⏳ FloodWait при get_messages({msg_id}) — ждём {wait_s} сек...")
             await asyncio.sleep(wait_s)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            await _wait_for_network()
+            await asyncio.sleep(3)
 
     if not target_msg:
         raise ValueError(f"Сообщение {msg_id} не найдено")
@@ -708,14 +759,14 @@ async def download_with_retry(
 
     attempt = 0
     flood_attempts = 0
-    CHUNK_ALIGN = 4096           # Обязательное выравнивание offset в Telegram API
-    CHUNK_SIZE = 512 * 1024      # 512 КБ — стабильно для мобильного интернета
+    CHUNK_ALIGN = 4096
+    CHUNK_SIZE = 512 * 1024
 
     while True:
         attempt += 1
         try:
             last_activity = [time.monotonic()]
-            _stalled = [False]
+            stalled = [False]
 
             def wrapped_progress(received, total):
                 last_activity[0] = time.monotonic()
@@ -730,7 +781,7 @@ async def download_with_retry(
                     if task_to_cancel.done():
                         return
                     if time.monotonic() - last_activity[0] > 15:
-                        _stalled[0] = True
+                        stalled[0] = True
                         task_to_cancel.cancel()
                         return
 
@@ -738,7 +789,6 @@ async def download_with_retry(
                 current_offset = 0
                 if os.path.exists(part_path):
                     raw_size = os.path.getsize(part_path)
-                    # Выравниваем хвост файла до 4096 байт, чтобы Telegram не вернул OFFSET_INVALID
                     current_offset = (raw_size // CHUNK_ALIGN) * CHUNK_ALIGN
 
                 mode = "r+b" if current_offset > 0 else "wb"
@@ -763,7 +813,7 @@ async def download_with_retry(
             try:
                 saved_path = await dl_task
             except asyncio.CancelledError:
-                if _stalled[0]:
+                if stalled[0]:
                     raise asyncio.TimeoutError("Нет прогресса скачивания > 15 сек")
                 raise
             finally:
@@ -808,7 +858,7 @@ async def download_with_retry(
 
         except FileReferenceExpiredError:
             _log(f"🔄 Истёк file_reference для msg_id={msg_id}, обновляем сообщение...")
-            await _wait_for_network()
+            await _ensure_connected()
             old_local_path = local_path
             target_msg = await client.get_messages(channel, ids=msg_id)
             if not target_msg or not target_msg.media:
@@ -836,10 +886,10 @@ async def download_with_retry(
             attempt = max(0, attempt - 1)
 
         except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as e:
-            # Сначала проверяем, не пропал ли интернет
-            had_outage = await _wait_for_network()
+            # Сбрасываем зависшее соединение и ждём реального ответа от серверов Telegram
+            had_outage = await _ensure_connected()
             if had_outage:
-                # Если сети реально не было — не тратим счётчик попыток и сразу докачиваем
+                # Интернет пропадал — не тратим попытку и продолжаем докачку
                 attempt = max(0, attempt - 1)
                 continue
 
@@ -982,19 +1032,16 @@ async def _send_media(
     display_name: str,
     progress_callback=None,
     caption: str | None = None,
+    max_retries: int = 3,
 ):
     kind = _get_send_kind(display_name or path)
     fname = display_name or os.path.basename(path)
     loop = asyncio.get_running_loop()
 
-    if kind == "photo":
-        return await client.send_file(
-            chat,
-            path,
-            caption=caption or "",
-            force_document=False,
-            progress_callback=progress_callback,
-        )
+    # Заранее готовим атрибуты, чтобы не перечитывать метаданные при каждом повторе
+    attrs = None
+    force_document = False
+    supports_streaming = False
 
     if kind == "video":
         dur, w, h = await loop.run_in_executor(None, _video_meta_sync, path)
@@ -1008,17 +1055,8 @@ async def _send_media(
         ]
         if _is_meaningful_name(fname):
             attrs.append(DocumentAttributeFilename(file_name=fname))
-        return await client.send_file(
-            chat,
-            path,
-            caption=caption or "",
-            supports_streaming=True,
-            force_document=False,
-            attributes=attrs,
-            progress_callback=progress_callback,
-        )
-
-    if kind == "audio":
+        supports_streaming = True
+    elif kind == "audio":
         dur = await loop.run_in_executor(None, _audio_meta_sync, path)
         tag_title, tag_performer = await loop.run_in_executor(None, _audio_tags_sync, path)
         fallback_title = os.path.splitext(fname)[0] if _is_meaningful_name(fname) else ""
@@ -1032,24 +1070,98 @@ async def _send_media(
         ]
         if _is_meaningful_name(fname):
             attrs.append(DocumentAttributeFilename(file_name=fname))
-        return await client.send_file(
-            chat,
-            path,
-            caption=caption or "",
-            force_document=False,
-            attributes=attrs,
-            progress_callback=progress_callback,
-        )
+    elif kind != "photo":
+        attrs = [DocumentAttributeFilename(file_name=fname)] if fname else None
+        force_document = True
 
-    attrs = [DocumentAttributeFilename(file_name=fname)] if fname else None
-    return await client.send_file(
-        chat,
-        path,
-        caption=caption or "",
-        force_document=True,
-        attributes=attrs,
-        progress_callback=progress_callback,
-    )
+    attempt = 0
+    flood_attempts = 0
+
+    while True:
+        attempt += 1
+        try:
+            await _ensure_connected()
+
+            last_activity = [time.monotonic()]
+            stalled = [False]
+
+            async def _wrapped_upload_cb(current, total):
+                last_activity[0] = time.monotonic()
+                if progress_callback:
+                    res = progress_callback(current, total)
+                    if asyncio.iscoroutine(res):
+                        await res
+
+            async def _upload_watchdog(task_to_cancel: asyncio.Task):
+                while not task_to_cancel.done():
+                    await asyncio.sleep(5)
+                    if task_to_cancel.done():
+                        return
+                    # Для отправки даём 25 сек без прогресса (финализация больших файлов на сервере может занять 10–15 сек)
+                    if time.monotonic() - last_activity[0] > 25:
+                        stalled[0] = True
+                        task_to_cancel.cancel()
+                        return
+
+            send_coro = client.send_file(
+                chat,
+                path,
+                caption=caption or "",
+                supports_streaming=supports_streaming,
+                force_document=force_document,
+                attributes=attrs,
+                progress_callback=_wrapped_upload_cb,
+            )
+            ul_task = asyncio.create_task(send_coro)
+            wd_task = asyncio.create_task(_upload_watchdog(ul_task))
+
+            try:
+                return await ul_task
+            except asyncio.CancelledError:
+                if stalled[0]:
+                    raise asyncio.TimeoutError("Нет прогресса отправки > 25 сек")
+                raise
+            finally:
+                wd_task.cancel()
+                try:
+                    await wd_task
+                except BaseException:
+                    pass
+
+        except asyncio.CancelledError:
+            raise
+
+        except FloodWaitError as e:
+            flood_attempts += 1
+            if flood_attempts > 10:
+                raise
+            wait_s = int(e.seconds) + 2
+            _log(f"⏳ FloodWait при отправке {fname} — ждём {wait_s} сек...")
+            await asyncio.sleep(wait_s)
+            attempt = max(0, attempt - 1)
+
+        except Exception as e:
+            # Проверяем, не пропал ли интернет во время отправки
+            had_outage = await _ensure_connected()
+            if had_outage:
+                attempt = max(0, attempt - 1)
+                continue
+
+            if "429" in str(e) or "InvalidBufferError" in type(e).__name__:
+                _log(f"⏳ HTTP 429 при отправке {fname} — пауза 10 сек перед повтором...")
+                await asyncio.sleep(10.0)
+                attempt = max(0, attempt - 1)
+                continue
+
+            if attempt >= max_retries:
+                raise
+
+            delay = min(5 * (2 ** (attempt - 1)), 60)
+            _log(
+                f"⚠️  обрыв отправки {fname} ({attempt}/{max_retries}): "
+                f"{type(e).__name__}: {e} — повтор через {delay} сек"
+            )
+            await asyncio.sleep(delay)
 
 
 # ---------- Статусы ----------
@@ -1107,20 +1219,40 @@ def _initial_status_text(it: dict) -> str:
     }
     return _render_status(st_stub, link, force_status=status)
 
+_global_edit_lock = asyncio.Lock()
+_global_edit_state = {"last_ts": 0.0, "cooldown_until": 0.0}
+_GLOBAL_EDIT_MIN_INTERVAL = 1.5   # Общая пауза между любыми edit в аккаунте (защита от 429)
+_PER_MSG_EDIT_INTERVAL = 4.0      # Минимальный интервал обновления одного и того же сообщения
+
+
 async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: bool = False):
     st = batch["link_states"].get(key)
     status_msg = batch["status_msgs"].get(key)
     if st is None or status_msg is None:
         return
-    async with batch["lock"]:
-        now = time.time()
-        if not force and now - st.get("last_edit", 0) < 3:
+
+    now = time.monotonic()
+
+    # 1. Быстрая проверка до захвата блокировок: не слишком ли рано для этой ссылки
+    if not force and now - st.get("last_edit", 0.0) < _PER_MSG_EDIT_INTERVAL:
+        return
+
+    # 2. Если сервер прислал 429 или FloodWait — не стучимся до окончания паузы
+    if now < _global_edit_state["cooldown_until"]:
+        if not force:
             return
-        st["last_edit"] = now
+        wait_cd = _global_edit_state["cooldown_until"] - now
+        if wait_cd > 0:
+            await asyncio.sleep(wait_cd)
+
+    # 3. Собираем актуальный текст под локальной блокировкой батча
+    async with batch["lock"]:
+        now = time.monotonic()
+        if not force and now - st.get("last_edit", 0.0) < _PER_MSG_EDIT_INTERVAL:
+            return
 
         batch_id = batch.get("batch_id")
         json_status = None
-        item = None
         if batch_id is not None:
             item = _find_item(batch_id, key[0], key[1])
             if item is not None:
@@ -1131,37 +1263,65 @@ async def _update_status_msg(batch: dict, key: tuple, full_link: str, force: boo
 
         queue_pos = None
         queue_total = None
-        if (json_status or st.get("status")) == "downloaded":
-            if batch_id is not None:
-                q = queues.get(batch_id)
-                if q is not None:
-                    items = q.get("items", [])
-                    queue_total = len(items)
-                    for i, it in enumerate(items):
-                        if (it["chat_id"] == key[0]
-                                and it["msg_id"] == key[1]):
-                            queue_pos = i + 1
-                            break
+        if (json_status or st.get("status")) == "downloaded" and batch_id is not None:
+            q = queues.get(batch_id)
+            if q is not None:
+                items = q.get("items", [])
+                queue_total = len(items)
+                for i, it in enumerate(items):
+                    if it["chat_id"] == key[0] and it["msg_id"] == key[1]:
+                        queue_pos = i + 1
+                        break
+
+        new_text = _render_status(
+            st, full_link,
+            queue_pos=queue_pos,
+            queue_total=queue_total,
+            force_status=json_status,
+        )
+        if new_text == st.get("last_text"):
+            return
+
+    # 4. Глобальный троттлинг: выстраиваем edit-запросы от всех воркеров в общую очередь
+    async with _global_edit_lock:
+        now = time.monotonic()
+        if now < _global_edit_state["cooldown_until"]:
+            if not force:
+                return
+            await asyncio.sleep(_global_edit_state["cooldown_until"] - now)
+
+        elapsed = time.monotonic() - _global_edit_state["last_ts"]
+        if elapsed < _GLOBAL_EDIT_MIN_INTERVAL:
+            if not force:
+                return
+            await asyncio.sleep(_GLOBAL_EDIT_MIN_INTERVAL - elapsed)
+
+        if not client.is_connected():
+            return
 
         try:
-            await status_msg.edit(_render_status(
-                st, full_link,
-                queue_pos=queue_pos,
-                queue_total=queue_total,
-                force_status=json_status,
-            ))
+            await status_msg.edit(new_text)
+            done_ts = time.monotonic()
+            st["last_edit"] = done_ts
+            st["last_text"] = new_text
+            _global_edit_state["last_ts"] = done_ts
         except MessageNotModifiedError:
-            pass
+            st["last_text"] = new_text
+            st["last_edit"] = time.monotonic()
         except FloodWaitError as fwe:
-            _log(
-                f"[flood] edit статуса {full_link}: {fwe.seconds}s — "
-                f"пропускаю обновление"
-            )
+            wait_s = int(fwe.seconds) + 2
+            _global_edit_state["cooldown_until"] = time.monotonic() + wait_s
+            _log(f"[flood] edit статуса {full_link}: пауза {wait_s}s")
         except Exception as e:
-            _log(
-                f"[status] edit упал для {full_link}: "
-                f"{type(e).__name__}: {e}"
-            )
+            err_str = str(e)
+            # При HTTP 429 или обрыве сети ставим глобальную паузу на 10 секунд для всех воркеров
+            if "429" in err_str or "InvalidBufferError" in type(e).__name__:
+                _global_edit_state["cooldown_until"] = time.monotonic() + 10.0
+                _log(f"[status] HTTP 429 для {full_link} — пауза обновлений статусов на 10с")
+            else:
+                st["last_edit"] = time.monotonic()
+                _log(f"[status] edit пропущен для {full_link}: {type(e).__name__}: {e}")
+
 
 def _release_processed(key: tuple, result: str) -> str:
     processed.discard(key)
@@ -1220,10 +1380,8 @@ async def process_link(chat_id, msg_id, link: str, batch_id: int) -> str:
             st["current"] = received
             st["total"] = total or 0
             st["percent"] = (received / total * 100.0) if total else 0.0
-            if time.time() - st.get("last_edit", 0) >= 3 or (total and received >= total):
+            if time.monotonic() - st.get("last_edit", 0.0) >= _PER_MSG_EDIT_INTERVAL or (total and received >= total):
                 loop.create_task(_update_status_msg(batch, key, link))
-
-
     try:
         filename = None
         if existing_local:
@@ -1733,22 +1891,22 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
     await _update_status_msg(batch, key, full_link, force=True)
 
     async def upload_cb(current, total):
-        now = time.time()
-        batch["_last_upload_activity_ts"] = now
-        if now - st.get("last_up_cb", 0) > 3 or current == total:
-            st["last_up_cb"] = now
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        batch["_last_upload_activity_ts"] = now_wall
+
+        if now_mono - st.get("last_up_cb", 0.0) >= _PER_MSG_EDIT_INTERVAL or (total and current >= total):
+            st["last_up_cb"] = now_mono
             st["up_current"] = current
             st["up_total"] = total
             st["up_percent"] = (current / total) * 100 if total else 0
             cur_item = _find_item(batch_id, chat_id, msg_id)
-            if cur_item is None:
-                return
-            if cur_item.get("status") in ("fail", "done", "skip"):
+            if cur_item is None or cur_item.get("status") in ("fail", "done", "skip"):
                 return
 
             pct = (current / total * 100) if total else 0
             last_pct = st.get("_last_logged_pct", -1)
-            if pct - last_pct >= 10 or current == total:
+            if pct - last_pct >= 10 or (total and current >= total):
                 st["_last_logged_pct"] = pct
                 _log(
                     f"📤 [upload] {display_name}: {pct:.1f}% "
@@ -1757,6 +1915,9 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
+
+
+
 
     caption = None
     kind = _get_send_kind(filename)
@@ -2932,7 +3093,7 @@ async def main():
         f"📤 Запущено upload-воркеров: {CONCURRENT_UPLOADS} "
     )
 
-    watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=60.0))
+    watchdog_task = asyncio.create_task(_watchdog_stuck_batches(interval=120.0))
     _log("🐕 Запущен watchdog зависших пачек")
 
     if await _prompt_orphan_uploads(scan):
