@@ -535,60 +535,117 @@ async def _prompt_orphan_uploads(scan: dict, timeout: float = 30.0) -> bool:
     print("⏭  Файлы остаются в папке загрузки, отправка пропущена.")
     return False
 
-
 async def _upload_orphans_directly(scan: dict):
     manual_files = scan.get("manual", [])
     if not manual_files:
         return
-    for full_path in manual_files:
+
+    limit = LIMIT_PREMIUM if account_state.get("is_premium") else LIMIT_FREE
+    valid_items: list[dict] = []
+    status_msgs: dict[tuple, any] = {}
+    link_states: dict[tuple, dict] = {}
+
+    for idx, full_path in enumerate(manual_files, start=1):
         name = os.path.basename(full_path)
         try:
             size = os.path.getsize(full_path)
-            limit = LIMIT_PREMIUM if account_state.get("is_premium") else LIMIT_FREE
-            if size > limit:
-                _log(
-                    f"⚠️  {name}: размер {human_size(size)} превышает лимит "
-                    f"{human_size(limit)} — пропущено (файл оставлен на диске)"
-                )
-                continue
         except Exception:
             size = 0
+
+        if size > limit:
+            _log(
+                f"⚠️  {name}: размер {human_size(size)} превышает лимит "
+                f"{human_size(limit)} — пропущено (файл оставлен на диске)"
+            )
+            continue
 
         try:
             found = await _find_in_me(display_name=name, file_size=size)
         except Exception:
             found = None
+
         if found is not None:
-            _log(
-                f"✅ {name}: уже в «Избранном» (id={found}) — удаляю локальный"
-            )
+            _log(f"✅ {name}: уже в «Избранном» (id={found}) — удаляю локальный")
             try:
                 os.remove(full_path)
             except Exception:
                 pass
             continue
 
+        # Используем отрицательный msg_id, чтобы не пересекаться с реальными ID сообщений
+        chat_id = "local_orphan"
+        msg_id = -idx
+        key = (chat_id, msg_id)
+
+        # Обязательный caption для всех видеофайлов
+        is_video = _get_send_kind(full_path) == "video"
+        video_caption = f"🎬 {name}" if is_video else None
+
         try:
-            sent = await _send_media("me", full_path, name)
-            sent_msg = sent[0] if isinstance(sent, list) else sent
-            sent_id = getattr(sent_msg, "id", None)
-            if sent_id is None:
-                _log(f"❌ {name}: send_file вернул id=None — оставляю файл")
-                continue
-            _log(f"📤 {name} ({human_size(size)}) → me (id={sent_id})")
-            try:
-                os.remove(full_path)
-                _log(f"🧹 удалён локальный файл: {name}")
-            except Exception as e:
-                _log(f"⚠️  не удалось удалить {name}: {e}")
-        except FloodWaitError as fwe:
-            _log(
-                f"⏳ {name}: FloodWait {fwe.seconds}s при отправке — "
-                f"файл оставлен, повтор при следующем запуске"
+            status_msg = await client.send_message(
+                "me",
+                f"⏳ ожидание ({human_size(size)}) {name}"
             )
-            continue
+        except FloodWaitError as fwe:
+            await asyncio.sleep(int(fwe.seconds) + 2)
+            status_msg = await client.send_message(
+                "me",
+                f"⏳ ожидание ({human_size(size)}) {name}"
+            )
         except Exception as e:
-            _log(f"❌ {name}: {type(e).__name__}: {e} — файл оставлен")
+            _log(f"⚠️  {name}: не удалось создать статус в me ({e}) — пропуск")
+            continue
+
+        status_msgs[key] = status_msg
+        link_states[key] = {
+            "status": "downloaded",
+            "percent": 100.0,
+            "current": size,
+            "total": size,
+            "last_edit": time.monotonic(),
+            "up_current": 0,
+            "up_total": size,
+            "up_percent": 0.0,
+            "last_up_cb": 0.0,
+            "file_size": size,
+        }
+        valid_items.append({
+            "chat_id": chat_id,
+            "msg_id": msg_id,
+            "link": name,  # В статусе будет отображаться имя файла
+            "status": "downloaded",
+            "status_msg_id": status_msg.id,
+            "file_message_id": None,
+            "local_file": name,
+            "file_size": size,
+            "caption": video_caption,
+            "downloaded_at": time.time(),
+            "download_only": False,
+        })
+
+    if not valid_items:
+        return
+
+    async with batch_create_lock:
+        batch_counter["id"] += 1
+        batch_id = batch_counter["id"]
+        _create_queue(batch_id, valid_items)
+        batches[batch_id] = {
+            "batch_id": batch_id,
+            "event": _make_fake_event(),
+            "status_msgs": status_msgs,
+            "link_states": link_states,
+            "lock": asyncio.Lock(),
+            "total": len(valid_items),
+            "ok": 0,
+            "skip": 0,
+            "fail": 0,
+            "finished": False,
+            "to_delete": [],
+        }
+
+    _log(f"📤 Передано локальных файлов в очередь отправки (batch #{batch_id}): {len(valid_items)}")
+
 
 def _cleanup_partial(local_path: str, expected_size: int = 0):
     if not local_path:
@@ -1159,7 +1216,8 @@ def _render_status(st: dict, full_link: str,
                    force_status: str | None = None) -> str:
     status = force_status if force_status is not None else st["status"]
     if status == "fail":
-        return f"❌ {full_link}"
+        err = st.get("error")
+        return f"❌ {full_link}\n⚠️ Причина: {err}" if err else f"❌ {full_link}"
     if status == "skip":
         return f"⚠️ {full_link} (пропущено)"
     if status == "downloaded":
@@ -1910,9 +1968,9 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
 
 
 
-    caption = None
+    caption = it.get("caption")
     kind = _get_send_kind(filename)
-    if kind == "video":
+    if kind == "video" and not caption:
         caption = f"🎬 {display_name}"
 
     try:
@@ -1934,13 +1992,18 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
         st["status"] = "downloaded"
         await _update_status_msg(batch, key, full_link, force=True)
         return "deferred"
+
     except Exception as e:
-        _log(f"❌ upload-воркер: {full_link}: {type(e).__name__}: {e}")
+        err_reason = f"{type(e).__name__}: {e}"
+        _log(f"❌ upload-воркер: {full_link}: {err_reason}")
         try:
             actual = os.path.getsize(filename)
         except Exception:
             actual = 0
-        if file_size > 0 and actual >= file_size:
+
+        is_local_orphan = (chat_id == "local_orphan")
+
+        if not is_local_orphan and file_size > 0 and actual >= file_size:
             _log(
                 f"♻️  upload-воркер: {full_link}: файл целый "
                 f"({human_size(actual)}) — оставляю downloaded, повтор позже"
@@ -1948,15 +2011,26 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             _mark_item(
                 batch_id, chat_id, msg_id,
                 status="downloaded",
-                next_retry_ts=time.time() + 5,  
+                next_retry_ts=time.time() + 5,
             )
             st["status"] = "downloaded"
             await _update_status_msg(batch, key, full_link, force=True)
             return "deferred"
         else:
-            _cleanup_partial(filename, file_size)
-            _mark_item(batch_id, chat_id, msg_id, status="fail", local_file=None, next_retry_ts=0)
+            if not is_local_orphan:
+                _cleanup_partial(filename, file_size)
+            else:
+                _log(f"💾 upload-воркер: {full_link}: локальный файл сохранён на диске")
+
+            _mark_item(
+                batch_id, chat_id, msg_id,
+                status="fail",
+                error=err_reason,
+                local_file=local_name if is_local_orphan else None,
+                next_retry_ts=0,
+            )
             st["status"] = "fail"
+            st["error"] = err_reason
             await _update_status_msg(batch, key, full_link, force=True)
             return "fail"
 
