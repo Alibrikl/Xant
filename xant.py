@@ -3136,7 +3136,7 @@ async def main():
         except Exception as e:
             _log(f"⚠️  не удалось уведомить в me: {e}")
     else:
-        _log("✅ Все найденные файлы поставлены в очередь на отправку")
+        _log("✅")
 
     for qid in list(batches.keys()):
         await _maybe_finish_batch(qid)
