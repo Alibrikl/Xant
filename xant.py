@@ -71,11 +71,9 @@ def _pick_download_dir() -> str:
         )
     return fallback
 
-
 DOWNLOAD_DIR = _pick_download_dir()
 QUEUE_DIR = os.path.join(DOWNLOAD_DIR, "queues")
 os.makedirs(QUEUE_DIR, exist_ok=True)
-
 
 LIMIT_FREE = 2 * 1024 ** 3     # 2 ГиБ (2048 МиБ)
 LIMIT_PREMIUM = 4 * 1024 ** 3  # 4 ГиБ (4096 МиБ)
@@ -326,13 +324,11 @@ _find_in_me_lock = asyncio.Lock()
 _FIND_CACHE_MAX = 1000
 _FIND_MISS_TTL = 15.0
 
-
 def _find_cache_put(key, value):
     if len(_find_cache) >= _FIND_CACHE_MAX:
         oldest = next(iter(_find_cache))
         _find_cache.pop(oldest, None)
     _find_cache[key] = value
-
 
 async def _find_in_me(
     display_name: str,
@@ -407,7 +403,6 @@ async def _find_in_me(
             except Exception as e:
                 _log(f"  ⚠️  _find_in_me({display_name}): {type(e).__name__}: {e}")
                 return None
-
 
 def _mark_item(batch_id: int, chat_id, msg_id, **fields):
     it = _find_item(batch_id, chat_id, msg_id)
@@ -1383,7 +1378,6 @@ async def process_link(chat_id, msg_id, link: str, batch_id: int) -> str:
         return "skip"
     processed.add(key)
 
-
     st = batch.get("link_states", {}).get(key)
 
     item_entry = _find_item(batch_id, chat_id, msg_id)
@@ -1965,9 +1959,6 @@ async def _upload_one(batch_id: int, batch: dict, it: dict) -> str:
             if key in batch["status_msgs"]:
                 await _update_status_msg(batch, key, full_link)
 
-
-
-
     caption = it.get("caption")
     kind = _get_send_kind(filename)
     if kind == "video" and not caption:
@@ -2295,13 +2286,7 @@ async def _watchdog_stuck_batches(interval: float = 60.0):
             _log(f"🐕 watchdog: ошибка: {type(e).__name__}: {e}")
 
 async def _restore_batch_from_queue(qid: int, q: dict) -> bool:
-    """
-    Восстанавливает batches[qid] из JSON-очереди q, если батча ещё нет в памяти:
-    - удаляет старые статус-сообщения из «Избранного»;
-    - создаёт актуальные статус-сообщения для активных элементов;
-    - заполняет link_states и регистрирует батч в batches[qid].
-    Возвращает True, если батч существует или успешно создан.
-    """
+
     if qid in batches:
         return True
 
@@ -2994,11 +2979,6 @@ async def main():
         batch_counter["id"] = max(existing_ids)
         _log(f"🔢 batch_counter инициализирован: {batch_counter['id']}")
 
-    # Единый стартовый проход по всем JSON-очередям:
-    # 1) удаляем пустые очереди;
-    # 2) сбрасываем счётчик повторов для downloaded;
-    # 3) обнуляем next_retry_ts для завершённых элементов;
-    # 4) воскрешаем fail -> downloaded, если файл на диске цел.
     for qid in list(_list_queue_files()):
         q = _load_queue(qid)
         if not q:
